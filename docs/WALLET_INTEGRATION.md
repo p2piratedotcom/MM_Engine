@@ -40,10 +40,22 @@ reports only that the process is alive; it is not a readiness or trading
 authorization signal. The process exits gracefully when stdin closes or after
 an authenticated `POST /v1/engine/shutdown` with `{}`.
 
+On a normal shutdown it writes `MM_ENGINE_STOPPED ` followed by JSON with
+`orders_remaining` and `cancel_error`. The wallet must treat a missing report,
+a nonzero count, or a non-null error as a failed shutdown and keep KDF and Tor
+running so the operator can recover. Before shutdown, it must check
+`/v1/reconciliation` for `active_owned_swaps` and block logout/close while a
+swap is still in progress.
+
 ## Wallet API
 
 The allowlist in `vps_agent.py` limits wallet mode to strategy previews and
 management, market/coin/status reads, owned-order status and reconciliation.
+The authenticated credential endpoints report whether MEXC and Gate secrets
+exist in the Linux Secret Service and accept an explicit `STORE MEXC` or
+`STORE GATE` confirmation. They never return or log the secret values. A
+service restart is required after configuring credentials before the CEX
+worker can use them.
 It hides wallet-send, KDF lifecycle, coin activation, manual order publication,
 legacy repricing controls and coverage overrides. Unrecognized endpoints
 return 404 even when the caller has the session token. The `/v1/capabilities`
@@ -68,12 +80,13 @@ closing, and should not claim that an in-progress hedge is complete.
 
 ## Compatibility and release
 
-Protocol major `1` is fixed for this first adapter. A release manifest must
-name the engine version, source commit, platform, architecture, minimum wallet
-protocol, supported KDF version range and SHA-256 for the asset. The wallet
-must authenticate that manifest using a trusted key or other pinned release
-identity before installing it. Install in a versioned per-user directory and
-switch the active version only after verification. New internal strategy and
+Protocol major `1` is fixed for this first adapter. A release includes
+`compatibility.json` with the engine version, source commit, platform,
+architecture, wallet protocol, KDF 2.7 requirement and SHA-256 of the binary.
+The wallet pins this repository's numeric GitHub ID, accepts only an immutable
+release, verifies both GitHub asset digests and the compatibility manifest,
+then installs into a versioned private directory. GitHub's immutable release
+attestation binds the tag, source commit and assets. New internal strategy and
 exchange logic can ship in MM_Engine without a wallet patch while this
 contract remains compatible. New wallet controls may require a GUI update.
 

@@ -43,6 +43,7 @@ WALLET_GET_PATHS = frozenset({
     "/v1/markets", "/v1/market", "/v1/strategies/wallet",
     "/v1/strategies", "/v1/orders", "/v1/coverage",
     "/v1/reconciliation", "/v1/events/status", "/v1/repricing",
+    "/v1/credentials/status",
 })
 WALLET_POST_PATHS = frozenset({
     "/v1/strategies/capacity", "/v1/strategies/scale-preview",
@@ -52,7 +53,7 @@ WALLET_POST_PATHS = frozenset({
     "/v1/strategies/start", "/v1/strategies/pause",
     "/v1/strategies/start-all", "/v1/strategies/pause-all",
     "/v1/strategies/scale", "/v1/reconciliation/run",
-    "/v1/engine/shutdown",
+    "/v1/engine/shutdown", "/v1/credentials/store",
 })
 
 
@@ -92,6 +93,8 @@ def handler_factory(
     strategies=None,
     wallet_send=None,
     wallet_mode: bool = False,
+    cex_profile: str = "default",
+    wallet_live_enabled: bool = False,
 ) -> type[BaseHTTPRequestHandler]:
     if not token:
         raise ValueError("agent token is required")
@@ -115,7 +118,24 @@ def handler_factory(
                 return
             if path == "/v1/capabilities" and wallet_mode:
                 self._json(200, {"protocol": 1, "service": "MM_Engine",
-                                 "kdf_owner": "wallet", "venues": ["MEXC", "GATE"]})
+                                 "kdf_owner": "wallet", "venues": ["MEXC", "GATE"],
+                                 "live_enabled": wallet_live_enabled})
+            elif path == "/v1/credentials/status" and wallet_mode:
+                from .credentials import LinuxSecretService, SecretServiceError
+                try:
+                    keyring = LinuxSecretService(profile=cex_profile)
+                    available = {}
+                    for venue, loader in (("MEXC", keyring.load_mexc),
+                                          ("GATE", keyring.load_gate)):
+                        try:
+                            loader()
+                        except SecretServiceError:
+                            available[venue] = False
+                        else:
+                            available[venue] = True
+                    self._json(200, {"venues": available})
+                except SecretServiceError as exc:
+                    self._json(503, {"error": str(exc)})
             elif path == "/v1/status":
                 self._json(200, controller.status())
             elif path == "/v1/wallet/sends":
@@ -323,6 +343,24 @@ def handler_factory(
                 if path == "/v1/engine/shutdown" and wallet_mode:
                     result = {"stopping": True}
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
+                elif path == "/v1/credentials/store" and wallet_mode:
+                    from .credentials import (GateCredentials, LinuxSecretService,
+                                              MexcCredentials)
+                    venue = str(payload.get("venue", "")).upper()
+                    api_key = payload.get("api_key")
+                    api_secret = payload.get("api_secret")
+                    if (venue not in {"MEXC", "GATE"}
+                            or payload.get("confirmation") != "STORE " + venue
+                            or not isinstance(api_key, str) or not isinstance(api_secret, str)
+                            or not 1 <= len(api_key) <= 512
+                            or not 1 <= len(api_secret) <= 512):
+                        raise ValueError("credenziali o conferma non valide")
+                    keyring = LinuxSecretService(profile=cex_profile)
+                    if venue == "MEXC":
+                        keyring.store_mexc(MexcCredentials(api_key, api_secret))
+                    else:
+                        keyring.store_gate(GateCredentials(api_key, api_secret))
+                    result = {"stored": venue}
                 elif path.startswith('/v1/wallet/send/'):
                     if wallet_send is None:
                         raise ValueError('Invio wallet non configurato: aggiornare e riavviare il servizio locale.')
@@ -731,7 +769,7 @@ def build_controller(
 
 def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = False,
           mexc_profile: str = "default", wallet_mode: bool = False,
-          on_ready=None) -> None:
+          on_ready=None) -> dict[str, object]:
     if wallet_mode and (settings.manage_kdf or start_kdf or settings.agent_bind != "127.0.0.1"):
         raise ValueError("wallet mode must attach to an existing local KDF")
     if not settings.agent_token:
@@ -875,6 +913,9 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
             strategies=strategies,
             wallet_send=wallet_send,
             wallet_mode=wallet_mode,
+            cex_profile=mexc_profile,
+            wallet_live_enabled=(settings.kdf_order_writes and settings.auto_hedge
+                                 and settings.live_trading),
         ),
     )
     # Port zero allows the wallet to allocate an unused loopback port. The
@@ -926,6 +967,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
     )
     monitor.start()
     local_mexc = None
+    shutdown_report: dict[str, object] = {"orders_remaining": 0, "cancel_error": None}
     try:
         if with_mexc:
             local_mexc = LocalMexcWorker(settings, profile=mexc_profile)
@@ -968,7 +1010,9 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
             try:
                 controller.cancel_all_owned()
             except Exception as exc:
+                shutdown_report["cancel_error"] = str(exc)
                 print(f"ATTENZIONE: ordini posseduti non cancellati: {exc}", file=sys.stderr)
+        shutdown_report["orders_remaining"] = len(controller.ownership.active())
         if supervisor is not None:
             supervisor.stop()
         server.server_close()
@@ -979,6 +1023,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
         outbox.close()
         coverage.close()
         controller.ownership.close()
+    return shutdown_report
 
 
 def local_settings(settings: Settings, config_path: str | Path) -> Settings:

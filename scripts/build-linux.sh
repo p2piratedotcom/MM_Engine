@@ -7,12 +7,10 @@ if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
 fi
 
 python -m pip install -e '.[release]'
-python -m PyInstaller --clean --noconfirm --onedir --name mm-engine \
+python -m PyInstaller --clean --noconfirm --onefile \
+  --name mm-engine-linux-x86_64 \
   --collect-submodules kdf_mm --exclude-module PySide6 \
   scripts/mm_engine_entrypoint.py
 
-tag="${1:-local}"
-archive="dist/mm-engine-${tag}-linux-x86_64.tar.gz"
-tar -C dist -czf "$archive" mm-engine
-sha256sum "$archive"
-echo "Local candidate only: sign a compatibility manifest before publishing."
+sha256sum dist/mm-engine-linux-x86_64
+echo "Local candidate only: publish only as a GitHub immutable release."

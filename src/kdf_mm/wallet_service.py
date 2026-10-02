@@ -178,6 +178,7 @@ def main() -> int:
 
             threading.Thread(target=stop_on_wallet_exit, daemon=True).start()
 
-        serve(settings, with_mexc=with_cex, mexc_profile=profile,
-              wallet_mode=True, on_ready=on_ready)
-    return 0
+        report = serve(settings, with_mexc=with_cex, mexc_profile=profile,
+                       wallet_mode=True, on_ready=on_ready)
+        print("MM_ENGINE_STOPPED " + json.dumps(report), flush=True)
+    return 0 if report["orders_remaining"] == 0 and report["cancel_error"] is None else 2

@@ -7,3 +7,4 @@ var/
 runtime/
 build/
 dist/
+*.spec
