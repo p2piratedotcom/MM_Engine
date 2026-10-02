@@ -25,6 +25,11 @@ environment with `python -m pip install -e .`. The existing TUI workflow is
 documented in [local strategies](docs/LOCAL_STRATEGIES.md). The wallet adapter
 protocol is in [the integration contract](docs/WALLET_INTEGRATION.md).
 
+The wallet adapter's offline contract tests run with
+`python -m unittest discover -s tests -p test_wallet_adapter.py -v` and on
+every pull request. The broader TUI test suite still relies on fixtures and
+runtime assets from its original project; it is not a release gate here.
+
 Trading writes, auto hedge, live CEX trading and transfers start disabled.
 Review orders, swaps and the persistent hedge journal before any funded use.
 Only one engine instance may own a given state directory and KDF wallet.
