@@ -34,7 +34,8 @@ Only one engine instance may own a given state directory and KDF wallet.
 The Linux x86-64 release workflow builds a standalone binary with its Python
 runtime and writes `compatibility.json` with the source revision, KDF 2.7 and
 wallet protocol requirements and binary SHA-256. A `vX.Y.Z` tag publishes both
-assets as an immutable GitHub release. Repository release immutability must
+assets, plus third-party dependency and Python license notices, as an
+immutable GitHub release. Repository release immutability must
 remain enabled; otherwise the wallet refuses the download. The wallet checks
 the repository identity, release immutability, both GitHub asset digests and
 the manifest before making the binary executable. Other desktop platforms

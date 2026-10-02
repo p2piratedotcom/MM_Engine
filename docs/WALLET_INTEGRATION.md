@@ -84,7 +84,7 @@ Protocol major `1` is fixed for this first adapter. A release includes
 `compatibility.json` with the engine version, source commit, platform,
 architecture, wallet protocol, KDF 2.7 requirement and SHA-256 of the binary.
 The wallet pins this repository's numeric GitHub ID, accepts only an immutable
-release, verifies both GitHub asset digests and the compatibility manifest,
+release, verifies the GitHub asset digests, third-party license notices and the compatibility manifest,
 then installs into a versioned private directory. GitHub's immutable release
 attestation binds the tag, source commit and assets. New internal strategy and
 exchange logic can ship in MM_Engine without a wallet patch while this
