@@ -92,4 +92,5 @@ contract remains compatible. New wallet controls may require a GUI update.
 
 The existing TUI remains an operator client of the same service architecture.
 Its historical `local-service` command and state paths are unchanged by this
-adapter.
+adapter. Standalone operator use must supply its own KDF and coin registry;
+the extracted repository does not bundle those runtime assets.

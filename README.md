@@ -24,6 +24,11 @@ Python 3.11 or newer is required for source operation. Install in a virtual
 environment with `python -m pip install -e .`. The existing TUI workflow is
 documented in [local strategies](docs/LOCAL_STRATEGIES.md). The wallet adapter
 protocol is in [the integration contract](docs/WALLET_INTEGRATION.md).
+The standalone operator commands inherited from the TUI need an external KDF
+binary/configuration and coin registry supplied by the operator. The legacy
+`vendor/` and funded runtime files are intentionally absent from this repo;
+the wallet adapter instead attaches to the wallet's KDF 2.7 and passes its
+current coin registry at launch.
 
 The wallet adapter's offline contract tests run with
 `python -m unittest discover -s tests -p test_wallet_adapter.py -v` and on
