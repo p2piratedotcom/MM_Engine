@@ -25,6 +25,7 @@ from .models import DexSide
 from .outbox import HedgeEventOutbox, OutboxConflict
 from .ownership import OrderOwnershipStore
 from .public_feed import MexcPublicFeed, MexcPublicFeedGroup
+from .exchanges import create_client
 from .quote_engine import RepricingEngine
 from .reconciliation import KdfReconciler, KdfReconciliationError
 from .mexc import MexcClient, MexcError
@@ -56,7 +57,7 @@ WALLET_GET_PATHS = frozenset({
     "/v1/markets", "/v1/market", "/v1/strategies/wallet",
     "/v1/strategies", "/v1/orders", "/v1/coverage",
     "/v1/reconciliation", "/v1/events/status", "/v1/repricing",
-    "/v1/credentials/status",
+    "/v1/credentials/status", "/v1/exchanges/balances",
 })
 WALLET_POST_PATHS = frozenset({
     "/v1/strategies/capacity", "/v1/strategies/scale-preview",
@@ -133,6 +134,19 @@ def handler_factory(
                 self._json(200, {"protocol": 1, "service": "MM_Engine",
                                  "kdf_owner": "wallet", "venues": ["MEXC", "GATE"],
                                  "live_enabled": wallet_live_enabled})
+            elif path == "/v1/exchanges/balances" and wallet_mode:
+                try:
+                    from .exchanges.balances import PreviewBalances
+                    from .credentials import LinuxSecretService
+                    from .venues import normalize_cex
+                    venue = normalize_cex(parse_qs(urlparse(self.path).query).get("venue", ["MEXC"])[0])
+                    reader = PreviewBalances(keyring_factory=lambda: LinuxSecretService(profile=cex_profile))
+                    balances = reader.read_account(venue)
+                    self._json(200, {"venue": venue, "read_only": True,
+                        "balances": [{"ticker": key, "available": str(value)}
+                                     for key, value in balances.items()]})
+                except ValueError as exc:
+                    self._json(422, {"error": str(exc)})
             elif path == "/v1/credentials/status" and wallet_mode:
                 from .credentials import LinuxSecretService, SecretServiceError
                 try:
@@ -830,7 +844,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
         MexcPublicFeedGroup(
             {
                 symbol: MexcPublicFeed(
-                    client=MexcClient(base_url=settings.mexc_base_url,
+                    client=create_client("MEXC", base_url=settings.mexc_base_url,
                                       timeout=max(1.0, min(4.0, settings.market_data_max_age_ms / 2500))),
                     store=store,
                     snapshot_secret=settings.snapshot_secret,
@@ -878,11 +892,18 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
     strategy_store = StrategyStore(settings.state_db + ".strategies.sqlite3")
     if isinstance(public_feed, MexcPublicFeedGroup):
         public_feed.set_sample_sink(strategy_store.record_market_book_sample)
+    from .exchanges.balances import PreviewBalances
+    from .credentials import LinuxSecretService
+    preview_balances = PreviewBalances(
+        keyring_factory=lambda: LinuxSecretService(profile=mexc_profile),
+        base_urls={"MEXC": settings.mexc_base_url, "GATE": settings.gate_base_url},
+    ) if wallet_mode else None
     strategies = StrategyService(controller=controller, store=strategy_store,
+        preview_balances=preview_balances,
         feed_group=public_feed,
         public_clients={
-            "MEXC": MexcClient(base_url=settings.mexc_base_url),
-            "GATE": GateClient(base_url=settings.gate_base_url),
+            "MEXC": create_client("MEXC", base_url=settings.mexc_base_url),
+            "GATE": create_client("GATE", base_url=settings.gate_base_url),
         },
         venue_fees={"MEXC": settings.cex_taker_fee, "GATE": settings.gate_taker_fee},
         reconciliation=reconciliation, repricing=repricing,

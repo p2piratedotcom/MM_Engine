@@ -99,6 +99,8 @@ class MexcSymbolRules:
 
 
 class MexcClient:
+    supports_read_deadlines = True
+
     def __init__(
         self,
         *,

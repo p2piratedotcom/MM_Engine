@@ -38,9 +38,10 @@ LOG = logging.getLogger(__name__)
 class StrategyService:
     def __init__(self, *, controller, store: StrategyStore, feed_group, public_client=None,
                  public_clients=None,
-                 venue_fees=None,
+                 venue_fees=None, preview_balances=None,
                  reconciliation, repricing, clock=time.time, settlement=None) -> None:
         self.controller, self.store, self.feeds = controller, store, feed_group
+        self.preview_balances = preview_balances
         clients = dict(public_clients or {})
         # None remains a supported injected test/offline adapter when all
         # required snapshots are already present in the controller.
@@ -307,10 +308,19 @@ class StrategyService:
 
     def _preview(
         self, spec, *, extra=(), exclude=None, extra_specs=(), exclude_many=(),
-        diagnostics_only=False,
+        diagnostics_only=False, allow_read_only=False,
     ):
         c = self.controller
         coverage = c.coverage.status({}) if c.coverage else {}
+        if (not coverage.get("lease_fresh") and allow_read_only
+                and self.preview_balances is not None):
+            coverage = self.preview_balances(spec.cex)
+            # Private reads may take several seconds over Tor. Refresh depth
+            # afterwards without repeating cached symbol metadata.
+            if self.feeds is not None:
+                for route in (spec.base, spec.quote):
+                    if route.symbol:
+                        self.feeds.feeds[self._key(spec, route.symbol)].fetch_once()
         if not coverage.get("lease_fresh"):
             raise ValueError(f"saldo Spot {spec.cex} aggiornato richiesto per dimensionare l'ordine")
         required_symbols = {self._key(spec, r.symbol) for r in (spec.base, spec.quote) if r.symbol}
@@ -368,6 +378,9 @@ class StrategyService:
             for route in (spec.base, spec.quote) if route.symbol
             for side in ("BUY", "SELL")
         }
+        if (coverage.get("source") == "read_only_preview"
+                and time.monotonic() >= coverage["expires_monotonic"]):
+            raise ValueError(f"{spec.cex}: saldo preview scaduto durante il calcolo; riprovare")
         sizing_spec = (replace(spec, fixed_sold=min(spec.fixed_sold, remaining))
                        if spec.quantity_mode == "fixed" and not spec.replenish and remaining is not None and remaining > 0
                        else spec)
@@ -384,7 +397,7 @@ class StrategyService:
         with self.lock, self.controller._order_lock:
             self._register(spec, validate=True)
             exclude = tuple(o.order_uuid for o in self.orders_for(spec)) if spec.strategy_id in self._specs else ()
-            return self._preview(spec, diagnostics_only=True, exclude_many=exclude)
+            return self._preview(spec, diagnostics_only=True, exclude_many=exclude, allow_read_only=True)
 
     def scale_preview(self, payload):
         """Server-owned replicas: clients cannot override safety settings/routes."""
@@ -532,7 +545,7 @@ class StrategyService:
                 self._register(spec, validate=True)
             previews = []
             for spec in specs:
-                previews.append(self._preview(spec, extra=tuple(p.plan for p in previews), extra_specs=specs))
+                previews.append(self._preview(spec, extra=tuple(p.plan for p in previews), extra_specs=specs, allow_read_only=True))
                 self.minimum_volume(previews[-1].plan, spec)
             return {"previews": [p.payload() for p in previews], "specs": [s.payload() for s in specs],
                     "publication": "Configurazioni salvate in pausa; avvio separato, pubblicazione KDF sequenziale"}

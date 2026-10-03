@@ -1,0 +1,1 @@
+{"venue":"GATE","adapter":"gate_spot_v4","base_url":"https://api.gateio.ws/api/v4","legacy_keys":false,"private_read_timeout":8.0,"time_sync_budget_ms":12000,"recv_window_ms":5000,"timestamp_error_codes":[],"symbols_error_codes":[]}

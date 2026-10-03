@@ -58,3 +58,5 @@ published. The wallet cannot enable live trading merely by installing it.
 
 MM_Engine's own source is released under [The Unlicense](LICENSE).
 Third-party dependencies and KDF retain their respective licenses.
+
+Exchange configuration and preview sizing: [EXCHANGE_ARCHITECTURE.md](docs/EXCHANGE_ARCHITECTURE.md).

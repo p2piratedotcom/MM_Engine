@@ -90,40 +90,33 @@ class LocalMexcWorker:
         from .desktop_coverage import DesktopCoveragePublisher
         from .desktop_runtime import DesktopRuntime
         from .journal import HedgeJournal
-        from .mexc import MexcClient
-        from .gate import GateClient
+        from .exchanges import private_client, supported_venues
         if settings.auto_hedge and not settings.live_trading:
             raise ValueError("copertura live richiede KDF_MM_LIVE_TRADING=true")
         keyring = LinuxSecretService(profile=profile)
-        credentials = keyring.load_mexc()
-        try:
-            gate_credentials = keyring.load_gate()
-        except SecretServiceError:
-            gate_credentials = None
         self.lock = WorkerLock(settings.desktop_journal_db, cooperative=True)
         self.lock.__enter__()
         try:
             self.journal = HedgeJournal(settings.desktop_journal_db)
             events = VpsEventClient(base_url=f"http://127.0.0.1:{settings.agent_port}", token=settings.agent_token)
-            mexc = MexcClient(api_key=credentials.api_key, api_secret=credentials.api_secret,
-                              base_url=settings.mexc_base_url, trading_enabled=settings.auto_hedge,
-                              transfers_enabled=False)
-            clients = {"MEXC": mexc}
-            if gate_credentials is not None:
-                clients["GATE"] = GateClient(
-                    api_key=gate_credentials.api_key,
-                    api_secret=gate_credentials.api_secret,
-                    base_url=settings.gate_base_url,
-                    trading_enabled=settings.auto_hedge,
-                )
+            clients = {}
+            for venue in supported_venues():
+                try:
+                    clients[venue] = private_client(venue, keyring,
+                        base_url=getattr(settings, venue.lower() + "_base_url", None),
+                        trading_enabled=settings.auto_hedge)
+                except SecretServiceError:
+                    continue
+            if not clients:
+                raise SecretServiceError("Configurare le credenziali di almeno un CEX Spot")
             self.runtime = DesktopRuntime(
                 desktop=DesktopAgent(journal=self.journal, events=events,
                                      event_secret=settings.event_secret, consumer_id=settings.desktop_consumer_id),
-                coverage=DesktopCoveragePublisher(mexc=mexc, clients=clients, vps=events, event_secret=settings.event_secret,
+                coverage=DesktopCoveragePublisher(mexc=None, clients=clients, vps=events, event_secret=settings.event_secret,
                            consumer_id=settings.desktop_consumer_id, assets=(settings.mexc_base_asset, "USDT"),
                            ttl_seconds=settings.coverage_lease_ttl_seconds, live_hedging_enabled=settings.auto_hedge,
                            include_all_spot_assets=True),
-                hedging=AutomaticHedgeEngine(journal=self.journal, mexc=mexc, clients=clients,
+                hedging=AutomaticHedgeEngine(journal=self.journal, mexc=None, clients=clients,
                            venue_fees={"MEXC": settings.cex_taker_fee,
                                        "GATE": settings.gate_taker_fee},
                            max_slippage=settings.max_slippage,

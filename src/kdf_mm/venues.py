@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from .exchanges import load_config, supported_venues
 
-SUPPORTED_CEX = ("MEXC", "GATE")
+
+SUPPORTED_CEX = supported_venues()
 
 
 def normalize_cex(value: object) -> str:
@@ -17,7 +19,7 @@ def market_data_key(cex: object, symbol: str) -> str:
     normalized = symbol.strip().upper()
     if not normalized:
         raise ValueError("simbolo CEX richiesto")
-    return normalized if venue == "MEXC" else f"{venue}:{normalized}"
+    return normalized if load_config(venue).legacy_keys else f"{venue}:{normalized}"
 
 
 def coverage_asset_key(cex: object, asset: str) -> str:
@@ -25,4 +27,4 @@ def coverage_asset_key(cex: object, asset: str) -> str:
     normalized = asset.strip().upper()
     if not normalized:
         raise ValueError("asset CEX richiesto")
-    return normalized if venue == "MEXC" else f"{venue}:{normalized}"
+    return normalized if load_config(venue).legacy_keys else f"{venue}:{normalized}"
