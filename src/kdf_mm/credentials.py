@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -50,6 +51,23 @@ class LinuxSecretService:
         self.profile = profile
         self.executable = resolved
         self._runner = runner or subprocess.run
+
+    def _venue_kinds(self, venue: str):
+        if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,31}', venue):
+            raise ValueError('invalid credential venue')
+        prefix = '' if venue == 'MEXC' else venue.lower() + '-'
+        return prefix + 'api-key', prefix + 'api-secret'
+
+    def load(self, venue: str):
+        kinds = self._venue_kinds(venue)
+        values = [self._lookup(kind) for kind in kinds]
+        if not all(values):
+            raise SecretServiceError(f'{venue} credentials are incomplete')
+        return MexcCredentials(*values)
+
+    def store(self, venue: str, credentials):
+        for kind, value in zip(self._venue_kinds(venue), (credentials.api_key, credentials.api_secret)):
+            self._store(kind, value, f'P2Pirate {venue} Spot credential')
 
     def load_mexc(self) -> MexcCredentials:
         api_key = self._lookup("api-key")

@@ -45,9 +45,10 @@ class StrategyService:
         clients = dict(public_clients or {})
         # None remains a supported injected test/offline adapter when all
         # required snapshots are already present in the controller.
-        clients.setdefault("MEXC", public_client)
+        if public_client is not None or not clients:
+            clients.setdefault("MEXC", public_client)
         self.public_clients = {normalize_cex(k): v for k, v in clients.items()}
-        self.public_client = self.public_clients["MEXC"]
+        self.public_client = self.public_clients.get("MEXC", next(iter(self.public_clients.values())))
         self.venue_fees = {normalize_cex(k): D(str(v))
                            for k, v in (venue_fees or {}).items()}
         self.reconciliation, self.repricing = reconciliation, repricing

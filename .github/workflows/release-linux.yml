@@ -55,6 +55,7 @@ jobs:
               'platform': 'linux',
               'architecture': 'x86_64',
               'wallet_protocol': 1,
+              'plugin_protocol': 1,
               'kdf_major_minor': '2.7',
               'binary': binary.name,
               'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
