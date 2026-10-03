@@ -83,15 +83,18 @@ class MexcPublicFeed:
     def fetch_once(self) -> Mapping[str, Any]:
         with self._lock:
             self._timings_ms = {}
-        # A socket timeout is not a request deadline. Bound the entire fetch,
-        # including uncached rules/volume, well below snapshot expiry.
-        budget = min(4.0, self.store.max_age_ms / 2500)
-        deadline = time.monotonic() + budget
-        rules = self._stage('symbol_rules', lambda: self._symbol_rules(deadline))
-        ticker = self._stage('ticker_24h', lambda: self._ticker_24h(deadline))
-        # Fetch the time-sensitive book last, immediately before ingestion.
+        # Static symbol rules and rolling volume can arrive slowly over Tor.
+        # They do not determine the book's age, so do not spend its freshness
+        # budget on these requests. Both metadata reads share a hard deadline.
+        metadata_deadline = time.monotonic() + 12.0
+        rules = self._stage('symbol_rules', lambda: self._symbol_rules(metadata_deadline))
+        ticker = self._stage('ticker_24h', lambda: self._ticker_24h(metadata_deadline))
+        # Start a separate, short deadline immediately before requesting the
+        # time-sensitive book. MexcClient timestamps it before the network call;
+        # MarketDataStore rejects it if it is stale when received.
+        book_deadline = time.monotonic() + min(4.0, self.store.max_age_ms / 2500)
         book = self._stage('depth', lambda: self._read(
-            self.client.order_book, self.symbol, deadline=deadline,
+            self.client.order_book, self.symbol, deadline=book_deadline,
             limit=self.depth_limit,
         ))
         if not book.bids or not book.asks:
