@@ -82,7 +82,41 @@ class StrategyStore:
                 VALUES(NEW.id,NEW.state,NEW.detail,NEW.confirmations,NEW.preview);
             END;
         """)
+        self._ensure_creation_numbers()
         self._market_sample_writes = 0
+
+    def _ensure_creation_numbers(self) -> None:
+        """Persist display numbers explicitly; SQLite rowids can change on VACUUM."""
+        with self.lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                columns = {row["name"] for row in self.db.execute("PRAGMA table_info(strategies)")}
+                if "creation_number" not in columns:
+                    self.db.execute("ALTER TABLE strategies ADD COLUMN creation_number INTEGER")
+                next_number = self.db.execute(
+                    "SELECT COALESCE(MAX(creation_number),0) FROM strategies"
+                ).fetchone()[0]
+                for row in self.db.execute(
+                    "SELECT id FROM strategies WHERE creation_number IS NULL ORDER BY rowid"
+                ).fetchall():
+                    next_number += 1
+                    self.db.execute("UPDATE strategies SET creation_number=? WHERE id=?",
+                                    (next_number, row["id"]))
+                self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS strategy_creation_number ON strategies(creation_number)")
+                # Allocate under SQLite's writer lock, including legacy insert paths.
+                self.db.execute("""
+                    CREATE TRIGGER IF NOT EXISTS strategy_creation_number_insert
+                    AFTER INSERT ON strategies WHEN NEW.creation_number IS NULL
+                    BEGIN
+                        UPDATE strategies SET creation_number=(
+                            SELECT COALESCE(MAX(creation_number),0)+1 FROM strategies
+                        ) WHERE id=NEW.id;
+                    END
+                """)
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
 
     def record_market_book_sample(self, sample: dict[str, Any]) -> None:
         """Store compact public-book evidence for later depth/threshold analysis."""
@@ -188,7 +222,7 @@ class StrategyStore:
 
     def rows(self, *, include_deleted=False) -> list[dict[str, Any]]:
         with self.lock:
-            rows = self.db.execute("SELECT * FROM strategies" + ("" if include_deleted else " WHERE state != 'DELETED'") + " ORDER BY id").fetchall()
+            rows = self.db.execute("SELECT * FROM strategies" + ("" if include_deleted else " WHERE state != 'DELETED'") + " ORDER BY creation_number").fetchall()
         return [{**dict(row), "spec": json.loads(row["spec"]), "preview": json.loads(row["preview"])} for row in rows]
 
     def get(self, strategy_id: str) -> dict[str, Any]:
