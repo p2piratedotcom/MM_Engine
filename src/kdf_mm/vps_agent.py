@@ -27,13 +27,26 @@ from .ownership import OrderOwnershipStore
 from .public_feed import MexcPublicFeed, MexcPublicFeedGroup
 from .quote_engine import RepricingEngine
 from .reconciliation import KdfReconciler, KdfReconciliationError
-from .mexc import MexcClient
-from .gate import GateClient
+from .mexc import MexcClient, MexcError
+from .gate import GateClient, GateError
 from .supervisor import KdfSupervisor, KdfSupervisorError
 from .vps_controller import ActiveOrderLimitError, VpsController, quote_plan_payload
 
 
 MAX_BODY_BYTES = 1_000_000
+
+
+def _safe_cex_error(exc: MexcError) -> str:
+    """Expose a useful failure without reflecting remote payloads or secrets."""
+    venue = "Gate" if isinstance(exc, GateError) else "MEXC"
+    if exc.status is not None:
+        return f"{venue} API rejected the request (HTTP {exc.status})"
+    message = str(exc)
+    if message.startswith("remote API is unreachable"):
+        return f"{venue} {message}"
+    if exc.payload is None and message.startswith(f"{venue} ") and len(message) <= 200:
+        return message
+    return f"{venue} API request failed"
 
 # A wallet client must not inherit the operator API's wallet-send, KDF
 # lifecycle, coin activation or manual order controls. Keep this list explicit
@@ -586,6 +599,8 @@ def handler_factory(
                 self._json(502, {"error": str(exc)})
             except KdfSupervisorError as exc:
                 self._json(409, {"error": str(exc)})
+            except MexcError as exc:
+                self._json(502, {"error": _safe_cex_error(exc)})
             except Exception as exc:
                 self._json(500, {"error": f"internal agent error: {type(exc).__name__}"})
 
