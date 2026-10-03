@@ -7,8 +7,6 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
 from .market_data import MarketDataStore, with_snapshot_signature
-from .mexc import MexcClient
-from .gate import GateClient
 from .venues import market_data_key
 
 
@@ -196,7 +194,7 @@ class MexcPublicFeed:
             )
 
     def _read(self, callback, *args, deadline: float, **kwargs):
-        if isinstance(self.client, (MexcClient, GateClient)):
+        if getattr(self.client, "supports_read_deadlines", False) is True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise MexcPublicFeedError(f"{self.venue} public-feed read deadline expired")

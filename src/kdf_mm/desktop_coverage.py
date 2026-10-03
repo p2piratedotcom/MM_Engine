@@ -6,8 +6,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Protocol
 
 from .coverage import build_coverage_envelope
-from .mexc import MexcClient, MexcError
-from .gate import GateClient
+from .mexc import MexcError
+from .exchanges import load_config
 from .venues import coverage_asset_key, market_data_key, normalize_cex
 
 
@@ -48,7 +48,7 @@ class DesktopCoveragePublisher:
     def __init__(
         self,
         *,
-        mexc: MexcCoverageApi,
+        mexc: MexcCoverageApi | None = None,
         clients: Mapping[str, MexcCoverageApi] | None = None,
         vps: VpsCoverageApi,
         event_secret: str,
@@ -66,9 +66,12 @@ class DesktopCoveragePublisher:
         if ttl_ms <= 0 or ttl_ms > 30_000:
             raise ValueError("coverage lease TTL must be in (0, 30] seconds")
         configured = dict(clients or {})
-        configured.setdefault("MEXC", mexc)
+        if mexc is not None:
+            configured.setdefault("MEXC", mexc)
+        if not configured:
+            raise ValueError("at least one Spot exchange client is required")
         self.clients = {normalize_cex(name): client for name, client in configured.items()}
-        self.mexc = self.clients["MEXC"]
+        self.mexc = self.clients.get("MEXC") or next(iter(self.clients.values()))
         self.vps = vps
         self.event_secret = event_secret
         self.consumer_id = consumer_id
@@ -125,10 +128,12 @@ class DesktopCoveragePublisher:
 
     def _read(self, client, callback):
         # Only read endpoints. Never alter timeouts/retry policy of hedge writes.
-        if isinstance(client, (MexcClient, GateClient)):
+        if getattr(client, "supports_read_deadlines", False) is True:
+            venue = next(name for name, value in self.clients.items() if value is client)
+            policy = load_config(venue)
             # Two bounded GETs fit inside one coverage lease renewal. Calling
             # the endpoint again creates a new timestamp and signature.
-            read_timeout = min(1.8, self.ttl_ms / 6000)
+            read_timeout = min(policy.private_read_timeout, self.ttl_ms / 2500)
             for attempt in range(2):
                 try:
                     return callback(
@@ -138,7 +143,7 @@ class DesktopCoveragePublisher:
                 except MexcError as exc:
                     retryable = (
                         isinstance(exc.payload, Mapping)
-                        and str(exc.payload.get("code")) == "700003"
+                        and str(exc.payload.get("code")) in policy.timestamp_error_codes
                     ) or (exc.status is None and "(timeout)" in str(exc))
                     if attempt or not retryable:
                         raise
@@ -158,12 +163,12 @@ class DesktopCoveragePublisher:
             payload = self._read(client, client.self_symbols)
         except MexcError as exc:
             if (isinstance(exc.payload, Mapping)
-                    and str(exc.payload.get('code')) == '-1121'):
+                    and str(exc.payload.get('code')) in load_config(venue).symbols_error_codes):
                 self._symbols_failures[venue] += 1
                 delay = min(30.0, 3.0 * 2 ** min(self._symbols_failures[venue] - 1, 4))
                 self._symbols_retry_at[venue] = time.monotonic() + delay
                 raise CoveragePublisherError(
-                    f"MEXC selfSymbols -1121 senza parametro symbol; "
+                    f"{venue} elenco simboli non disponibile; "
                     f"autorizzazioni non verificate, riprova tra {delay:.0f}s"
                 ) from exc
             raise
@@ -179,10 +184,10 @@ class DesktopCoveragePublisher:
             if time.monotonic() - self._time_checked[venue] >= 60:
                 self._time_sync[venue] = self._stage(
                     f'{venue.lower()}_time',
-                    lambda client=client: client.synchronize_time(max_round_trip_ms=2_000),
+                    lambda venue=venue, client=client: client.synchronize_time(
+                        max_round_trip_ms=load_config(venue).time_sync_budget_ms),
                 )
                 self._time_checked[venue] = time.monotonic()
-        time_sync = self._time_sync.get("MEXC") or next(iter(self._time_sync.values()), None)
         hedge_symbols: list[str] = []
         if self.include_all_spot_assets:
             for venue, client in self.clients.items():
@@ -198,8 +203,6 @@ class DesktopCoveragePublisher:
         account_started = time.monotonic()
         # Date the lease at the request, not after all subsequent network calls.
         issued_at_ms = int(self.clock_ms()) if self.clock_ms is not None else time.time_ns() // 1_000_000
-        if hasattr(time_sync, "offset_ms"):
-            issued_at_ms += int(time_sync.offset_ms)
         issued_at_ms = max(issued_at_ms, self._last_issued_at_ms + 1)
         selected: dict[str, Decimal] = {}
         for venue, client in self.clients.items():
@@ -242,8 +245,8 @@ class DesktopCoveragePublisher:
         )
 
     @staticmethod
-    def _balances(payload: Mapping[str, Any], *, venue: str = "MEXC") -> dict[str, Decimal]:
-        if payload.get("canTrade") is not True or payload.get("accountType") != "SPOT":
+    def _balances(payload: Mapping[str, Any], *, venue: str = "MEXC", require_trading: bool = True) -> dict[str, Decimal]:
+        if payload.get("accountType") != "SPOT" or (require_trading and payload.get("canTrade") is not True):
             raise CoveragePublisherError(f"{venue} account is not enabled for Spot trading")
         rows = payload.get("balances")
         if not isinstance(rows, list):

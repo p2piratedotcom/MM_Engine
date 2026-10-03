@@ -25,6 +25,8 @@ class GateError(MexcError):
 
 
 class GateClient:
+    supports_read_deadlines = True
+
     def __init__(
         self,
         *,

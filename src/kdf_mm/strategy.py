@@ -291,10 +291,10 @@ def preview_strategy(
         caps[f"{side.value}_{route.asset}_profondità_50%"] = max(ZERO, depth * spec.depth_fraction - reserved) / units
         caps[f"{route.asset}_volume_24h"] = snap.base_volume_24h * daily_volume_fraction / units
         if side is HedgeSide.BUY:
-            caps[f"MEXC_USDT_per_{route.asset}"] = max(ZERO,
+            caps[f"{spec.cex}_USDT_per_{route.asset}"] = max(ZERO,
                 cex_free.get("USDT", ZERO) / (boundary * (ONE + fee)) - snap.quantity_step) / units
         else:
-            caps[f"MEXC_{route.asset}"] = cex_free.get(route.asset, ZERO) / ((ONE + fee) * units)
+            caps[f"{spec.cex}_{route.asset}"] = cex_free.get(route.asset, ZERO) / ((ONE + fee) * units)
         legs.append((route, side, units, boundary, snap))
     allowed = min(caps.values())
     if spec.quantity_mode == 'auto' and spec.auto_fraction < 1:
@@ -322,7 +322,7 @@ def preview_strategy(
                           'missing': str(max(ZERO, required - available))})
     limiting = [key for key, cap in caps.items() if cap == allowed]
     if precision_maximum < raw_maximum:
-        limiting.append("precisione_hedge_MEXC")
+        limiting.append(f"precisione_hedge_{spec.cex}")
     report = {'cex': spec.cex, 'maximum': str(maximum), 'minimum': str(minimum),
               'feasible_maximum': str(precision_maximum if precision_maximum >= minimum else ZERO),
               'coin': spec.sold.ticker, 'limiting': limiting, 'funds': shortages,

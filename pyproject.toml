@@ -20,3 +20,6 @@ mm-engine = "kdf_mm.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"kdf_mm.exchanges" = ["config/*.json"]

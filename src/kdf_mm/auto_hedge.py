@@ -41,7 +41,7 @@ class AutomaticHedgeEngine:
         self,
         *,
         journal: HedgeJournal,
-        mexc: Any,
+        mexc: Any = None,
         clients: dict[str, Any] | None = None,
         venue_fees: dict[str, Decimal] | None = None,
         max_slippage: Decimal,
@@ -53,9 +53,12 @@ class AutomaticHedgeEngine:
             raise ValueError("automatic hedge attempts must be in [1, 10]")
         self.journal = journal
         configured = {str(k).upper(): v for k, v in (clients or {}).items()}
-        configured.setdefault("MEXC", mexc)
+        if mexc is not None:
+            configured.setdefault("MEXC", mexc)
+        if not configured:
+            raise ValueError("at least one Spot exchange client is required")
         self.clients = configured
-        self.mexc = self.clients["MEXC"]
+        self.mexc = self.clients.get("MEXC") or next(iter(self.clients.values()))
         fees = {str(k).upper(): Decimal(str(v)) for k, v in (venue_fees or {}).items()}
         self.max_attempts = max_attempts
         self.baskets = {

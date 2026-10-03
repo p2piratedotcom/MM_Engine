@@ -142,6 +142,7 @@ def _settings(bootstrap: dict[str, object]) -> tuple[Settings, str, bool]:
         auto_hedge=live.get("auto_hedge", False),
         kdf_order_writes=live.get("kdf_order_writes", False),
         live_transfers=False,
+        coverage_lease_ttl_seconds=30.0,
         mexc_public_feed=True,
     )
     return settings, profile, with_cex
