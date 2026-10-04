@@ -815,6 +815,13 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
         max_override_seconds=settings.coverage_override_seconds,
     )
     controller = build_controller(settings, coverage=coverage)
+    if wallet_mode:
+        # Wallet strategies register their own venue-qualified markets/stores
+        # below, including paused strategies restored from durable storage.
+        # Keep market_data as the signing/clock template, but do not retain CLI
+        # seed markets whose stores would have no matching wallet feed.
+        controller.markets = {}
+        controller.market_data_by_symbol = {}
     coin_profiles = CoinProfileStore(settings.coin_profile_path)
     outbox = HedgeEventOutbox(
         settings.outbox_db,
@@ -852,7 +859,8 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
                     depth_limit=settings.mexc_depth_limit,
                 )
                 for symbol, store in ({} if wallet_mode else controller.market_data_by_symbol).items()
-            }
+            },
+            allow_empty=wallet_mode,
         )
         if settings.mexc_public_feed
         else None

@@ -80,6 +80,24 @@ closing, and should not claim that an in-progress hedge is complete.
 
 ## Compatibility and release
 
+### Wallet feed initialization
+
+Wallet mode starts with an explicitly allowed empty feed group. Stored
+strategies (including paused ones) register their own markets, venue-qualified
+stores and feeds before the service becomes ready. With no strategies, no
+exchange feed runs. The controller retains its signing/clock template but drops
+the CLI's predefined markets/stores so active wallet coins cannot subscribe to
+unregistered feeds, and MEXC strategies cannot reuse a store with no feed.
+Standalone CLI mode still requires a nonempty initial feed group. This fixes
+the v0.2.0 wallet startup failure `at least one public feed is required`.
+
+Local diagnosis on 2026-10-04 reproduced that exception using the released
+v0.2.0 Linux binary with disposable credentials and inaccessible loopback
+RPC/proxy endpoints. The rebuilt candidate reached `MM_ENGINE_READY`, loaded
+one copied saved strategy, reported all seven installed venues with
+`live_enabled: false`, and shut down with exit code zero. This confirms startup
+and saved configuration restoration, not exchange account access or live orders.
+
 Protocol major `1` is fixed for this first adapter. A release includes
 `compatibility.json` with the engine version, source commit, platform,
 architecture, wallet protocol, KDF 2.7 requirement and SHA-256 of the binary.
