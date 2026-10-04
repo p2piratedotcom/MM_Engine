@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "p2pirate-mm-engine"
-version = "0.1.0"
-description = "P2Pirate market maker engine for KDF, MEXC and Gate"
+version = "0.2.0"
+description = "KDF market maker with downloadable Spot exchange plugins"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Unlicense" }

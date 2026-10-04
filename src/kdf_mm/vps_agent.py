@@ -25,7 +25,8 @@ from .models import DexSide
 from .outbox import HedgeEventOutbox, OutboxConflict
 from .ownership import OrderOwnershipStore
 from .public_feed import MexcPublicFeed, MexcPublicFeedGroup
-from .exchanges import create_client
+from .exchanges import create_client, supported_venues, load_config
+from .exchanges.plugin_catalog import installed_plugins
 from .quote_engine import RepricingEngine
 from .reconciliation import KdfReconciler, KdfReconciliationError
 from .mexc import MexcClient, MexcError
@@ -39,7 +40,7 @@ MAX_BODY_BYTES = 1_000_000
 
 def _safe_cex_error(exc: MexcError) -> str:
     """Expose a useful failure without reflecting remote payloads or secrets."""
-    venue = "Gate" if isinstance(exc, GateError) else "MEXC"
+    venue = getattr(exc, "venue", "Gate" if isinstance(exc, GateError) else "MEXC")
     if exc.status is not None:
         return f"{venue} API rejected the request (HTTP {exc.status})"
     message = str(exc)
@@ -132,7 +133,9 @@ def handler_factory(
                 return
             if path == "/v1/capabilities" and wallet_mode:
                 self._json(200, {"protocol": 1, "service": "MM_Engine",
-                                 "kdf_owner": "wallet", "venues": ["MEXC", "GATE"],
+                                 "kdf_owner": "wallet", "venues": list(supported_venues()),
+                                 "plugin_protocol": 1,
+                                 "plugins_external": installed_plugins() is not None,
                                  "live_enabled": wallet_live_enabled})
             elif path == "/v1/exchanges/balances" and wallet_mode:
                 try:
@@ -152,10 +155,9 @@ def handler_factory(
                 try:
                     keyring = LinuxSecretService(profile=cex_profile)
                     available = {}
-                    for venue, loader in (("MEXC", keyring.load_mexc),
-                                          ("GATE", keyring.load_gate)):
+                    for venue in supported_venues():
                         try:
-                            loader()
+                            keyring.load(venue)
                         except SecretServiceError:
                             available[venue] = False
                         else:
@@ -376,17 +378,14 @@ def handler_factory(
                     venue = str(payload.get("venue", "")).upper()
                     api_key = payload.get("api_key")
                     api_secret = payload.get("api_secret")
-                    if (venue not in {"MEXC", "GATE"}
+                    if (venue not in supported_venues()
                             or payload.get("confirmation") != "STORE " + venue
                             or not isinstance(api_key, str) or not isinstance(api_secret, str)
                             or not 1 <= len(api_key) <= 512
                             or not 1 <= len(api_secret) <= 512):
                         raise ValueError("credenziali o conferma non valide")
                     keyring = LinuxSecretService(profile=cex_profile)
-                    if venue == "MEXC":
-                        keyring.store_mexc(MexcCredentials(api_key, api_secret))
-                    else:
-                        keyring.store_gate(GateCredentials(api_key, api_secret))
+                    keyring.store(venue, MexcCredentials(api_key, api_secret))
                     result = {"stored": venue}
                 elif path.startswith('/v1/wallet/send/'):
                     if wallet_send is None:
@@ -852,7 +851,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
                     interval_seconds=settings.mexc_feed_interval_seconds,
                     depth_limit=settings.mexc_depth_limit,
                 )
-                for symbol, store in controller.market_data_by_symbol.items()
+                for symbol, store in ({} if wallet_mode else controller.market_data_by_symbol).items()
             }
         )
         if settings.mexc_public_feed
@@ -902,10 +901,12 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
         preview_balances=preview_balances,
         feed_group=public_feed,
         public_clients={
-            "MEXC": create_client("MEXC", base_url=settings.mexc_base_url),
-            "GATE": create_client("GATE", base_url=settings.gate_base_url),
+            venue: create_client(venue, base_url=getattr(settings,venue.lower()+"_base_url",None))
+            for venue in supported_venues()
         },
-        venue_fees={"MEXC": settings.cex_taker_fee, "GATE": settings.gate_taker_fee},
+        venue_fees={venue: Decimal(load_config(venue).taker_fee) if installed_plugins() is not None
+            else getattr(settings, "cex_taker_fee" if venue == "MEXC" else venue.lower()+"_taker_fee", settings.cex_taker_fee)
+            for venue in supported_venues()},
         reconciliation=reconciliation, repricing=repricing,
         settlement=local_settlement(
             settings.desktop_journal_db, controller.ownership, controller.kdf
@@ -1059,6 +1060,8 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
         outbox.close()
         coverage.close()
         controller.ownership.close()
+        from .exchanges.plugin_client import close_plugins
+        close_plugins()
     return shutdown_report
 
 

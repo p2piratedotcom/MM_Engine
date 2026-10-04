@@ -90,7 +90,8 @@ class LocalMexcWorker:
         from .desktop_coverage import DesktopCoveragePublisher
         from .desktop_runtime import DesktopRuntime
         from .journal import HedgeJournal
-        from .exchanges import private_client, supported_venues
+        from .exchanges import private_client, supported_venues, load_config
+        from .exchanges.plugin_catalog import installed_plugins
         if settings.auto_hedge and not settings.live_trading:
             raise ValueError("copertura live richiede KDF_MM_LIVE_TRADING=true")
         keyring = LinuxSecretService(profile=profile)
@@ -117,8 +118,9 @@ class LocalMexcWorker:
                            ttl_seconds=settings.coverage_lease_ttl_seconds, live_hedging_enabled=settings.auto_hedge,
                            include_all_spot_assets=True),
                 hedging=AutomaticHedgeEngine(journal=self.journal, mexc=None, clients=clients,
-                           venue_fees={"MEXC": settings.cex_taker_fee,
-                                       "GATE": settings.gate_taker_fee},
+                           venue_fees={venue: Decimal(load_config(venue).taker_fee) if installed_plugins() is not None
+                            else getattr(settings, "cex_taker_fee" if venue == "MEXC" else venue.lower()+"_taker_fee",settings.cex_taker_fee)
+                            for venue in clients},
                            max_slippage=settings.max_slippage,
                            fee_buffer=settings.cex_taker_fee, depth_limit=settings.mexc_depth_limit,
                            max_attempts=settings.auto_hedge_max_attempts) if settings.auto_hedge else None)

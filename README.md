@@ -60,3 +60,12 @@ MM_Engine's own source is released under [The Unlicense](LICENSE).
 Third-party dependencies and KDF retain their respective licenses.
 
 Exchange configuration and preview sizing: [EXCHANGE_ARCHITECTURE.md](docs/EXCHANGE_ARCHITECTURE.md).
+
+## Downloadable CEX plugins
+
+The wallet integration uses a stable Spot v1 process protocol and separate
+configuration+adapter bundles in
+[p2piratedotcom/CEX_configs](https://github.com/p2piratedotcom/CEX_configs).
+See [exchange architecture](docs/EXCHANGE_ARCHITECTURE.md) for compatibility,
+installation, trust boundaries and future exchange onboarding. The bundled
+legacy CLI adapters remain available when no external catalog is supplied.

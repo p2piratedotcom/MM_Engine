@@ -3,12 +3,9 @@ from __future__ import annotations
 from .exchanges import load_config, supported_venues
 
 
-SUPPORTED_CEX = supported_venues()
-
-
 def normalize_cex(value: object) -> str:
     venue = str(value or "MEXC").strip().upper()
-    if venue not in SUPPORTED_CEX:
+    if venue not in supported_venues():
         raise ValueError(f"CEX non supportato: {venue or '(vuoto)'}")
     return venue
 

@@ -74,6 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument("--json", action="store_true", help="stampa JSON")
     subparsers.add_parser("agent", help="avvia il VPS Agent locale")
+    subparsers.add_parser("plugin-capabilities", help="report the common plugin protocol without starting trading")
+    subparsers.add_parser("exchange-plugin-host", help="internal isolated Spot plugin host")
     subparsers.add_parser("wallet-service", help="servizio locale per P2Pirate via stdin")
     local = subparsers.add_parser(
         "local-service",
@@ -324,6 +326,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "plugin-capabilities":
+        print(json.dumps(dict(protocol=1, transport="stdio", wallet_protocol=1)))
+        return 0
+    if args.command == "exchange-plugin-host":
+        from .exchange_plugin_host import main as plugin_main
+        return plugin_main()
     if args.command == "wallet-service":
         from .wallet_service import main as wallet_main
 

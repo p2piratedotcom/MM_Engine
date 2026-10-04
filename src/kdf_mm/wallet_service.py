@@ -61,6 +61,7 @@ def _state_secrets(state_dir: Path) -> tuple[str, str]:
 
 
 def _settings(bootstrap: dict[str, object]) -> tuple[Settings, str, bool]:
+    from .exchanges.plugin_catalog import configure_plugins
     state_dir = _absolute_path(bootstrap.get("state_dir"), "state_dir")
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     if state_dir.stat().st_mode & 0o077:
@@ -145,6 +146,7 @@ def _settings(bootstrap: dict[str, object]) -> tuple[Settings, str, bool]:
         coverage_lease_ttl_seconds=30.0,
         mexc_public_feed=True,
     )
+    configure_plugins(bootstrap.get("cex_plugin_directory"), state_dir=str(state_dir))
     return settings, profile, with_cex
 
 
@@ -181,5 +183,7 @@ def main() -> int:
 
         report = serve(settings, with_mexc=with_cex, mexc_profile=profile,
                        wallet_mode=True, on_ready=on_ready)
+        from .exchanges.plugin_client import close_plugins
+        close_plugins()
         print("MM_ENGINE_STOPPED " + json.dumps(report), flush=True)
     return 0 if report["orders_remaining"] == 0 and report["cancel_error"] is None else 2
