@@ -242,8 +242,10 @@ class MexcPublicFeed:
 class MexcPublicFeedGroup:
     """Lifecycle and status adapter for all symbols required by configured markets."""
 
-    def __init__(self, feeds: Mapping[str, MexcPublicFeed]) -> None:
-        if not feeds:
+    def __init__(
+        self, feeds: Mapping[str, MexcPublicFeed], *, allow_empty: bool = False
+    ) -> None:
+        if not feeds and not allow_empty:
             raise ValueError("at least one public feed is required")
         self.feeds = {symbol.upper(): feed for symbol, feed in feeds.items()}
         self._active_symbols = set(self.feeds)
