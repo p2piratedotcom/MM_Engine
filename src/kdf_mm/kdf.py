@@ -59,12 +59,14 @@ class KdfRpcClient:
         self._capacity_lock = threading.RLock()
         self._capacity_reads = {}
         self._capacity_generation = 0
+        self._capacity_mutations = 0
         self._rpc_log = (_PrivateRpcLog(diagnostic_path, maxBytes=1048576, backupCount=2)
                          if diagnostic_path else None)
 
-    def _invalidate_capacity(self):
+    def _invalidate_capacity(self, mutation_delta=0):
         with self._capacity_lock:
             self._capacity_generation += 1
+            self._capacity_mutations += mutation_delta
             self._capacity_reads.clear()
 
     def _diagnostic(self, method, elapsed_ms, outcome):
@@ -178,7 +180,7 @@ class KdfRpcClient:
         with self._capacity_lock:
             cached = self._capacity_reads.get(coin)
             generation = self._capacity_generation
-            if cached and now - cached[0] < 2.0:
+            if cached and not self._capacity_mutations and now - cached[0] < 2.0:
                 return copy.deepcopy(cached[1])
         result = self.v2("max_maker_vol", {"coin": coin})
         raw = result.get('volume') if isinstance(result, Mapping) else None
@@ -190,7 +192,9 @@ class KdfRpcClient:
         except ArithmeticError:
             valid = False
         with self._capacity_lock:
-            if valid and generation == self._capacity_generation and time.monotonic() - now < 2.0:
+            if (valid and not self._capacity_mutations
+                    and generation == self._capacity_generation
+                    and time.monotonic() - now < 2.0):
                 self._capacity_reads[coin] = (now, copy.deepcopy(result))
         return result
 
@@ -359,7 +363,7 @@ class KdfRpcClient:
             'withdraw', 'send_raw_transaction', 'disable_coin',
         }
         if mutation:
-            self._invalidate_capacity()
+            self._invalidate_capacity(1)
         try:
             response = self.transport.request(
                 method="POST",
@@ -374,7 +378,7 @@ class KdfRpcClient:
 
         finally:
             if mutation:
-                self._invalidate_capacity()
+                self._invalidate_capacity(-1)
             elapsed_ms = round((time.monotonic() - started) * 1000)
             if outcome != 'received' or elapsed_ms >= 1000:
                 self._diagnostic(payload.get('method'), elapsed_ms, outcome)
