@@ -194,68 +194,89 @@ class SpotPluginClient:
 
     def call(self, method, *args, **kwargs):
         from ..exchange_plugin_host import METHODS
+        from ..network_diagnostics import emit as diagnostic
+        from uuid import uuid4
+        from .. import http
 
         if method not in METHODS:
             raise ValueError("unsupported Spot method")
         if method in ("place_limit_order", "cancel_order") and not self.trading_enabled:
             raise MexcError("Spot trading is disabled")
+        started, identity = time.monotonic(), uuid4().hex
+        started_at_ms = time.time_ns() // 1_000_000
+        # Only known public symbol argument positions; never account/order IDs.
+        symbol = args[0] if args and method in {
+            'order_book', 'ticker_24h', 'symbol_rules', 'check_symbol'} else None
+        diagnostic('plugin_request_start', request_id=identity, venue=self.item['venue'],
+                   symbol=symbol, method=method, started_at_ms=started_at_ms)
         with self._lock:
+            metrics = dict(queue_ms=round((time.monotonic()-started)*1000, 2))
+            phase, outcome, failure_kind, status = 'startup', 'received', None, None
+            adapter_ms, unknown = None, False
             try:
-                if self._process is None or self._process.poll() is not None:
-                    self.close()
-                    self._start()
+                stage = time.monotonic()
+                try:
+                    if self._process is None or self._process.poll() is not None:
+                        self.close()
+                        self._start()
+                finally:
+                    metrics['startup_ms'] = round((time.monotonic()-stage)*1000, 2)
                 self._sequence += 1
-                timeout = (
-                    kwargs.get("total_timeout")
-                    or kwargs.get("timeout")
-                    or self.options["timeout"]
-                )
-                # A time-sync call can include more than one bounded read.
-                budget = min(
-                    35.0,
-                    max(
-                        float(timeout) + 1,
-                        kwargs.get("max_round_trip_ms", 0) / 1000 + 1,
-                    ),
-                )
-                self._send(
-                    dict(id=self._sequence, method=method, args=args, kwargs=kwargs)
-                )
-                response = self._read(time.monotonic() + budget)
-                if (
-                    not isinstance(response, dict)
-                    or response.get("id") != self._sequence
-                ):
+                timeout = (kwargs.get("total_timeout") or kwargs.get("timeout")
+                           or self.options["timeout"])
+                budget = min(35.0, max(float(timeout)+1,
+                             kwargs.get("max_round_trip_ms", 0)/1000+1))
+                metrics.update(timeout_ms=round(float(timeout)*1000), reply_budget_ms=round(budget*1000))
+                phase, stage = 'send', time.monotonic()
+                self._send(dict(id=self._sequence, method=method, args=args, kwargs=kwargs))
+                metrics['send_ms'] = round((time.monotonic()-stage)*1000, 2)
+                phase, stage = 'reply_wait', time.monotonic()
+                try:
+                    response = self._read(time.monotonic()+budget)
+                finally:
+                    metrics['reply_wait_ms'] = round((time.monotonic()-stage)*1000, 2)
+                phase = 'decode'
+                if not isinstance(response, dict) or response.get("id") != self._sequence:
                     raise ValueError("invalid plugin response identity")
+                adapter_ms = response.get('adapter_ms')
                 if "error" in response:
+                    phase = 'adapter'
                     error = response["error"]
-                    exc = MexcError(
-                        f"{self.item['venue']} adapter request failed"
+                    failure_kind = error.get('failure_kind')
+                    if failure_kind not in {'timeout','http_rejected','invalid_data','connection_error','adapter_error'}:
+                        failure_kind = 'timeout' if error.get('retryable_timeout') else 'adapter_error'
+                    exc = MexcError(f"{self.item['venue']} adapter request failed"
                         + (" (timeout)" if error.get("retryable_timeout") else ""),
-                        status=error.get("status"),
-                        payload={"code": error.get("code")},
-                        execution_unknown=bool(error.get("execution_unknown")),
-                    )
+                        status=error.get("status"), payload={"code": error.get("code")},
+                        execution_unknown=bool(error.get("execution_unknown")))
                     exc.venue = self.item["venue"]
                     raise exc
                 result = decode(response["result"])
-                # Adapters cannot freshen an old book using a future timestamp.
                 if isinstance(result, OrderBook) and (
                     type(result.observed_at_ms) is not int
-                    or result.observed_at_ms > time.time_ns() // 1000000
-                ):
+                    or result.observed_at_ms > time.time_ns()//1000000):
                     raise ValueError("invalid order-book observation time")
                 return result
-            except MexcError:
+            except MexcError as exc:
+                outcome, status = 'error', exc.status
+                unknown = bool(getattr(exc, 'execution_unknown', False))
                 raise
-            except Exception:
+            except Exception as caught:
+                outcome, failure_kind = 'error', ('timeout' if isinstance(caught, TimeoutError)
+                                                 else type(caught).__name__)
                 self.close()
-                exc = MexcError(
-                    f"{self.item['venue']} plugin unavailable",
-                    execution_unknown=method in ("place_limit_order", "cancel_order"),
-                )
+                unknown = method in ("place_limit_order", "cancel_order")
+                exc = MexcError(f"{self.item['venue']} plugin unavailable", execution_unknown=unknown)
                 exc.venue = self.item["venue"]
                 raise exc from None
+            finally:
+                diagnostic('plugin_request_end', request_id=identity, venue=self.item['venue'],
+                           symbol=symbol, method=method, phase=phase, outcome=outcome,
+                           failure_kind=failure_kind, http_status=status, adapter_ms=adapter_ms,
+                           execution_unknown=unknown, lane='private' if self.options['api_key'] else 'public',
+                           route='tor' if http._wallet_proxy_url is not None else 'direct',
+                           elapsed_ms=round((time.monotonic()-started)*1000, 2),
+                           wall_elapsed_ms=time.time_ns()//1_000_000-started_at_ms, **metrics)
 
     def __getattr__(self, name):
         from ..exchange_plugin_host import METHODS

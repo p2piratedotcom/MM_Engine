@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any, Callable, Mapping, Sequence
 
 from .models import OrderBook
+from .network_diagnostics import emit as diagnostic
 
 
 class MarketDataError(ValueError):
@@ -169,9 +170,11 @@ class MarketDataStore:
             )
         now = self.clock_ms()
         if snapshot.observed_at_ms > now + self.max_future_skew_ms:
+            self._diagnostic_rejection(snapshot, now, 'book_future', 'ingest')
             raise MarketDataError("market snapshot is too far in the future")
-        self._check_volume_age(snapshot, now)
+        self._check_volume_age(snapshot, now, source="ingest")
         if now - snapshot.observed_at_ms > self.max_age_ms:
+            self._diagnostic_rejection(snapshot, now, "book_expired", "ingest")
             raise StaleMarketData("market snapshot arrived already stale")
         with self._lock:
             if self._current is not None and snapshot.sequence <= self._current.sequence:
@@ -187,13 +190,25 @@ class MarketDataStore:
         now = self.clock_ms()
         self._check_volume_age(current, now)
         if now - current.observed_at_ms > self.max_age_ms:
+            self._diagnostic_rejection(current, now, "book_expired", "current")
             raise StaleMarketData("market snapshot has expired")
         return current
 
-    def _check_volume_age(self, snapshot, now):
+    def _diagnostic_rejection(self, snapshot, now, reason, source):
+        volume = snapshot.volume_observed_at_ms
+        diagnostic('market_rejected', throttle_key=(id(self), reason, source),
+                   symbol=self.symbol, sequence=snapshot.sequence, reason=reason, source=source,
+                   now_ms=now, book_observed_ms=snapshot.observed_at_ms,
+                   volume_observed_ms=volume, book_age_ms=now-snapshot.observed_at_ms,
+                   volume_age_ms=None if volume is None else now-volume,
+                   book_max_age_ms=self.max_age_ms, volume_max_age_ms=15000)
+
+    def _check_volume_age(self, snapshot, now, source='current'):
         observed = snapshot.volume_observed_at_ms
         if observed is not None and (observed > now + self.max_future_skew_ms
                                       or now - observed >= 15000):
+            self._diagnostic_rejection(snapshot, now,
+                'volume_future' if observed > now+self.max_future_skew_ms else 'volume_expired', source)
             raise StaleMarketData('rolling-volume snapshot is expired or future-dated')
 
     def age_ms(self) -> int | None:

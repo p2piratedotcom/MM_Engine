@@ -5,6 +5,7 @@ import dataclasses
 import importlib
 import json
 import sys
+import time
 from decimal import Decimal
 
 from .exchanges.plugin_catalog import verify_catalog
@@ -109,6 +110,7 @@ def main():
         request = json.loads(line)
         identity = request.get("id")
         method = request.get("method")
+        started = time.monotonic()
         try:
             if type(identity) is not int or method not in METHODS:
                 raise ValueError("invalid protocol request")
@@ -130,7 +132,8 @@ def main():
 
                 keywords["side"] = HedgeSide(keywords["side"])
             result = getattr(client, method)(*arguments, **keywords)
-            reply({"id": identity, "result": encode(result)})
+            reply({"id": identity, "result": encode(result),
+                   "adapter_ms": round((time.monotonic()-started)*1000, 2)})
         except Exception as exc:
             # Never send raw remote errors, signed URLs or API credentials.
             code = getattr(exc, "payload", None)
@@ -141,6 +144,7 @@ def main():
             reply(
                 {
                     "id": identity,
+                    "adapter_ms": round((time.monotonic()-started)*1000, 2),
                     "error": {
                         "status": status if type(status) is int else None,
                         "code": code,
@@ -152,6 +156,15 @@ def main():
                             )
                         ),
                         "retryable_timeout": "(timeout)" in str(exc),
+                        # Fixed categories only; do not reflect arbitrary class
+                        # names/messages from a downloaded adapter.
+                        "failure_kind": (
+                            "timeout" if "(timeout)" in str(exc) or isinstance(exc, TimeoutError)
+                            else "http_rejected" if type(status) is int
+                            else "invalid_data" if isinstance(exc, (ValueError, KeyError, TypeError))
+                            else "connection_error" if isinstance(exc, OSError)
+                            else "adapter_error"
+                        ),
                     },
                 }
             )

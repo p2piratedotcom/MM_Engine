@@ -8,6 +8,8 @@ from typing import Any, Mapping
 
 from .market_data import MarketDataStore, with_snapshot_signature
 from .venues import market_data_key
+from .network_diagnostics import emit as diagnostic
+from uuid import uuid4
 
 
 class MexcPublicFeedError(RuntimeError):
@@ -79,19 +81,56 @@ class MexcPublicFeed:
         self._stop = threading.Event()
         self._lock = threading.RLock()
         self._timings_ms: dict[str, float] = {}
+        self._book_observed_ms: int | None = None
+
+    def _diagnostic(self, event, **fields):
+        # Diagnostic clock failures must not change refresh outcomes.
+        try:
+            now = self.clock_ms()
+        except Exception:
+            return
+        with self._lock:
+            book, volume = self._book_observed_ms, self._ticker_at_ms
+        diagnostic(event, venue=self.venue, symbol=self.symbol, now_ms=now,
+                   book_observed_ms=book, volume_observed_ms=volume,
+                   book_age_ms=None if book is None else now-book,
+                   volume_age_ms=None if volume is None else now-volume,
+                   book_max_age_ms=self.store.max_age_ms, volume_max_age_ms=15000,
+                   **fields)
 
     def _stage(self, name, callback):
         started = time.monotonic()
+        outcome, kind, status = 'received', None, None
+        self._diagnostic('feed_stage_start', phase=name)
         try:
             return callback()
+        except Exception as exc:
+            outcome, kind, status = 'error', type(exc).__name__, getattr(exc, 'status', None)
+            raise
         finally:
+            elapsed = round((time.monotonic() - started) * 1000, 2)
             with self._lock:
-                self._timings_ms[name] = round((time.monotonic() - started) * 1000, 2)
+                self._timings_ms[name] = elapsed
+            self._diagnostic('feed_stage_end', phase=name, elapsed_ms=elapsed,
+                             outcome=outcome, failure_kind=kind, http_status=status)
 
     def fetch_once(self) -> Mapping[str, Any]:
         # Manual previews may refresh while the polling thread is active.
+        started, identity = time.monotonic(), uuid4().hex
+        started_at_ms = time.time_ns() // 1_000_000
         with self._fetch_lock:
-            return self._fetch_once()
+            queue = round((time.monotonic()-started)*1000, 2)
+            self._diagnostic('feed_cycle_start', request_id=identity, queue_ms=queue, started_at_ms=started_at_ms)
+            outcome = 'received'
+            try:
+                return self._fetch_once()
+            except Exception:
+                outcome = 'error'
+                raise
+            finally:
+                self._diagnostic('feed_cycle_end', request_id=identity, outcome=outcome,
+                                 queue_ms=queue, elapsed_ms=round((time.monotonic()-started)*1000, 2),
+                                 wall_elapsed_ms=time.time_ns()//1_000_000-started_at_ms)
 
     def _fetch_once(self) -> Mapping[str, Any]:
         with self._lock:
@@ -110,6 +149,8 @@ class MexcPublicFeed:
             self.client.order_book, self.symbol, deadline=book_deadline,
             limit=self.depth_limit,
         ))
+        with self._lock:
+            self._book_observed_ms = book.observed_at_ms
         # Metadata can expire while a depth request is in flight. Recheck it
         # without extending its timestamp; a fresh book alone is insufficient.
         ticker = self._stage('ticker_24h_final', lambda: self._ticker_24h(metadata_deadline))
@@ -266,7 +307,9 @@ class MexcPublicFeed:
         return self._refresh_ticker(deadline)
 
     def _refresh_ticker(self, deadline):
+        queued = time.monotonic()
         with self._metadata_lock:
+            self._diagnostic('metadata_request_start', queue_ms=round((time.monotonic()-queued)*1000, 2))
             requested_at_ms = self.clock_ms()
             ticker = self._read(self._metadata_client.ticker_24h, self.symbol, deadline=deadline)
             try:
@@ -282,12 +325,14 @@ class MexcPublicFeed:
 
     def _run_metadata(self) -> None:
         failures = 0
+        expected = time.monotonic()
         while not self._stop.is_set():
+            self._diagnostic('metadata_wakeup', wakeup_lag_ms=max(0, round((time.monotonic()-expected)*1000)))
             try:
-                self._symbol_rules(time.monotonic() + 12.0)
+                self._stage('metadata_rules', lambda: self._symbol_rules(time.monotonic() + 12.0))
                 # Refresh ahead of the unchanged 15-second volume TTL, with
                 # a bounded request on a reader independent from order books.
-                self._refresh_ticker(time.monotonic() + 4.0)
+                self._stage('metadata_refresh', lambda: self._refresh_ticker(time.monotonic() + 4.0))
                 failures = 0
             except Exception:
                 failures += 1
@@ -299,11 +344,15 @@ class MexcPublicFeed:
             # two transient failures to exhaust the unchanged 15-second TTL.
             # Retry promptly, then back off during a sustained outage.
             delay = 5.0 if not failures else min(5.0, 0.5 * 2 ** min(failures - 1, 4))
+            self._diagnostic('metadata_retry', failures=failures, retry_delay_ms=round(delay*1000))
+            expected = time.monotonic() + delay
             self._stop.wait(delay)
 
     def _run(self) -> None:
+        expected = time.monotonic()
         while not self._stop.is_set():
             started = time.monotonic()
+            self._diagnostic('feed_wakeup', wakeup_lag_ms=max(0, round((started-expected)*1000)))
             try:
                 self.fetch_once()
             except Exception as exc:
@@ -315,7 +364,10 @@ class MexcPublicFeed:
                 failures = self._consecutive_failures
             delay = self.interval_seconds if not failures else min(
                 self.interval_seconds, 0.5 * 2 ** min(failures - 1, 4))
-            self._stop.wait(delay if failures else max(0.1, delay - elapsed))
+            wait = delay if failures else max(0.1, delay - elapsed)
+            self._diagnostic('feed_retry', failures=failures, retry_delay_ms=round(wait*1000))
+            expected = time.monotonic() + wait
+            self._stop.wait(wait)
 
 
 class MexcPublicFeedGroup:
