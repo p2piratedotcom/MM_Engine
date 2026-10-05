@@ -972,6 +972,10 @@ class VpsController:
                 except Exception as exc:
                     raise KdfPreflightError(f'lettura KDF prima dell’aggiornamento non riuscita: {exc}') from exc
                 delta = plan.kdf_volume - old_max
+                # Readback may spend several seconds waiting for KDF. Check
+                # current exposure again before recording/sending a mutation.
+                self._assert_market_fresh(plan.market_id)
+                self._assert_coverage(plan, excluding_order_uuid=order_uuid)
                 before_write(owned, minimum, old_price, old_max)
                 if (old_price == plan.kdf_price and delta == 0
                         and (minimum is None or Decimal(str(observed['min_base_vol'])) == minimum)):

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import copy
+import os
+import threading
+from logging.handlers import RotatingFileHandler
 import logging
 import time
 from datetime import datetime, timezone
@@ -24,6 +28,14 @@ class KdfPreflightError(KdfError):
     """setprice was not sent; unlike a write timeout, retrying a fresh plan is safe."""
 
 
+class _PrivateRpcLog(RotatingFileHandler):
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                     | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, 'a', encoding='utf-8')
+
+
 class KdfRpcClient:
     def __init__(
         self,
@@ -33,6 +45,7 @@ class KdfRpcClient:
         transport: JsonTransport | None = None,
         orders_enabled: bool = False,
         timeout: float = 15.0,
+        diagnostic_path: str | None = None,
     ) -> None:
         if not rpc_url:
             raise ValueError("rpc_url is required")
@@ -43,6 +56,33 @@ class KdfRpcClient:
         self.transport = transport or UrllibJsonTransport()
         self.orders_enabled = orders_enabled
         self.timeout = timeout
+        self._capacity_lock = threading.RLock()
+        self._capacity_reads = {}
+        self._capacity_generation = 0
+        self._rpc_log = (_PrivateRpcLog(diagnostic_path, maxBytes=1048576, backupCount=2)
+                         if diagnostic_path else None)
+
+    def _invalidate_capacity(self):
+        with self._capacity_lock:
+            self._capacity_generation += 1
+            self._capacity_reads.clear()
+
+    def _diagnostic(self, method, elapsed_ms, outcome):
+        # No payload, URL, response or exception text is retained.
+        safe_method = method if method in {
+            'max_maker_vol', 'my_orders', 'get_enabled_coins', 'setprice',
+            'update_maker_order', 'cancel_order', 'order_status', 'active_swaps',
+            'my_recent_swaps', 'my_swap_status', 'my_balance', 'trade_preimage',
+        } else 'other'
+        record = json.dumps({'observed_at_utc': datetime.now(timezone.utc).isoformat(),
+            'method': safe_method, 'elapsed_ms': elapsed_ms, 'outcome': outcome})
+        logging.getLogger(__name__).warning('KDF_RPC %s', record)
+        if self._rpc_log is not None:
+            try:
+                self._rpc_log.handle(logging.LogRecord(__name__, logging.WARNING,
+                    '', 0, record, (), None))
+            except Exception:
+                pass  # Optional diagnostics must never change RPC outcomes.
 
     def legacy(self, method: str, **params: object) -> Any:
         payload = {"userpass": self.userpass, "method": method, **params}
@@ -130,7 +170,29 @@ class KdfRpcClient:
         )
 
     def max_maker_volume(self, coin: str) -> Any:
-        return self.v2("max_maker_vol", {"coin": coin})
+        # Reuse a successful read for at most two seconds from request START.
+        # Preview, conservative-floor preview and final capacity validation used
+        # to issue identical chain-backed RPCs within the same cycle. KDF still
+        # validates actual balances for every volume-changing mutation.
+        now = time.monotonic()
+        with self._capacity_lock:
+            cached = self._capacity_reads.get(coin)
+            generation = self._capacity_generation
+            if cached and now - cached[0] < 2.0:
+                return copy.deepcopy(cached[1])
+        result = self.v2("max_maker_vol", {"coin": coin})
+        raw = result.get('volume') if isinstance(result, Mapping) else None
+        if isinstance(raw, Mapping):
+            raw = raw.get('decimal')
+        try:
+            volume = Decimal(str(raw))
+            valid = volume.is_finite() and volume >= 0
+        except ArithmeticError:
+            valid = False
+        with self._capacity_lock:
+            if valid and generation == self._capacity_generation and time.monotonic() - now < 2.0:
+                self._capacity_reads[coin] = (now, copy.deepcopy(result))
+        return result
 
     def trade_preimage(
         self,
@@ -237,7 +299,9 @@ class KdfRpcClient:
             if new_price <= 0:
                 raise ValueError("new_price must be positive")
             params["new_price"] = str(new_price)
-        if volume_delta is not None:
+        # Sending an explicit zero triggers KDF's chain balance/fee checks.
+        # Omit it for price-only updates; never replay nonzero deltas.
+        if volume_delta is not None and volume_delta != 0:
             params["volume_delta"] = str(volume_delta)
         if min_volume is not None:
             params["min_volume"] = str(min_volume)
@@ -290,6 +354,12 @@ class KdfRpcClient:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         started = time.monotonic()
         outcome = 'received'
+        mutation = payload.get('method') in {
+            'setprice', 'update_maker_order', 'cancel_order', 'buy', 'sell',
+            'withdraw', 'send_raw_transaction', 'disable_coin',
+        }
+        if mutation:
+            self._invalidate_capacity()
         try:
             response = self.transport.request(
                 method="POST",
@@ -303,12 +373,11 @@ class KdfRpcClient:
             raise KdfError(f"KDF RPC {payload.get('method', '?')}: {exc}", payload=exc.payload) from exc
 
         finally:
+            if mutation:
+                self._invalidate_capacity()
             elapsed_ms = round((time.monotonic() - started) * 1000)
             if outcome != 'received' or elapsed_ms >= 1000:
-                logging.getLogger(__name__).warning(
-                    'KDF_RPC observed_at_utc=%s method=%s elapsed_ms=%s outcome=%s',
-                    datetime.now(timezone.utc).isoformat(),
-                    payload.get('method', '?'), elapsed_ms, outcome)
+                self._diagnostic(payload.get('method'), elapsed_ms, outcome)
 
         if not isinstance(response, Mapping):
             raise KdfError("KDF returned a non-object response", payload=response)
