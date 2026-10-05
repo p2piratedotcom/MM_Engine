@@ -245,7 +245,7 @@ class KdfRpcClient:
         # A lost HTTP response is not evidence that the write failed. Snapshot
         # UUIDs before sending, and never retry setprice after an uncertain write.
         try:
-            before = self._maker_order_snapshot()
+            before = self._maker_order_snapshot(timeout=5.0)
             if any(o.get("base") == base and o.get("rel") == rel and uid not in allowed_existing_uuids
                    for uid, o in before.items()):
                 raise KdfError("existing KDF order for this direction requires reconciliation")
@@ -261,7 +261,10 @@ class KdfRpcClient:
             return result
         except KdfError as original:
             try:
-                after = self._maker_order_snapshot()
+                # The durable publication journal owns subsequent read-only
+                # recovery. Do not hold all order/strategy locks for another
+                # full 15-second RPC timeout after an uncertain write.
+                after = self._maker_order_snapshot(timeout=2.0)
                 candidates = [o for uuid, o in after.items() if uuid not in before
                               and o.get("base") == base and o.get("rel") == rel]
                 if len(candidates) == 1:
