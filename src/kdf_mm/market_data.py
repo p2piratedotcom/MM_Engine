@@ -67,6 +67,7 @@ class MarketSnapshot:
     price_step: Decimal
     min_quote_amount: Decimal
     signature: str
+    volume_observed_at_ms: int | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "MarketSnapshot":
@@ -84,6 +85,8 @@ class MarketSnapshot:
                 price_step=Decimal(str(payload["price_step"])),
                 min_quote_amount=Decimal(str(payload["min_quote_amount"])),
                 signature=str(payload["signature"]),
+                volume_observed_at_ms=(int(payload['volume_observed_at_ms'])
+                                       if 'volume_observed_at_ms' in payload else None),
             )
         except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
             raise MarketDataError("invalid market snapshot") from exc
@@ -93,6 +96,8 @@ class MarketSnapshot:
     def _validate(self) -> None:
         if self.sequence < 0 or self.observed_at_ms <= 0:
             raise MarketDataError("snapshot sequence and time must be positive")
+        if self.volume_observed_at_ms is not None and self.volume_observed_at_ms <= 0:
+            raise MarketDataError('rolling volume observation time must be positive')
         if not self.symbol or not self.signature:
             raise MarketDataError("snapshot symbol and signature are required")
         numeric = (
@@ -165,6 +170,7 @@ class MarketDataStore:
         now = self.clock_ms()
         if snapshot.observed_at_ms > now + self.max_future_skew_ms:
             raise MarketDataError("market snapshot is too far in the future")
+        self._check_volume_age(snapshot, now)
         if now - snapshot.observed_at_ms > self.max_age_ms:
             raise StaleMarketData("market snapshot arrived already stale")
         with self._lock:
@@ -178,9 +184,17 @@ class MarketDataStore:
             current = self._current
         if current is None:
             raise StaleMarketData("no market snapshot is available")
-        if self.clock_ms() - current.observed_at_ms > self.max_age_ms:
+        now = self.clock_ms()
+        self._check_volume_age(current, now)
+        if now - current.observed_at_ms > self.max_age_ms:
             raise StaleMarketData("market snapshot has expired")
         return current
+
+    def _check_volume_age(self, snapshot, now):
+        observed = snapshot.volume_observed_at_ms
+        if observed is not None and (observed > now + self.max_future_skew_ms
+                                      or now - observed >= 15000):
+            raise StaleMarketData('rolling-volume snapshot is expired or future-dated')
 
     def age_ms(self) -> int | None:
         with self._lock:

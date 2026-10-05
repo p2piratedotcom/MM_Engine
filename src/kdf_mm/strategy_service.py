@@ -207,6 +207,14 @@ class StrategyService:
                 row["remaining_sold"] = str(remaining) if remaining is not None else "automatico"
                 row["daily_remaining_sold"] = str(daily) if daily is not None else "nessun limite"
                 pending = self.controller.cancellations.pending(row['id'])
+                publications = self.controller.publications.pending(row['id'])
+                if publications and row['state'] in {'WRITING', 'REVIEW_REQUIRED'}:
+                    # A pending durable intent is being checked automatically.
+                    # HELD intents are excluded by pending() and stay in review.
+                    row['state'] = 'RECOVERING'
+                    checked = self._recovery_checked.get(row['id'], time.monotonic() - 10)
+                    row['recovery'] = {'operation': 'setprice', 'held': False,
+                        'next_retry_seconds': max(0, round(10 - (time.monotonic() - checked)))}
                 if pending:
                     checked = self._recovery_checked.get(('cancel', row['id']), time.monotonic() - 10)
                     row['recovery'] = {'operation': 'cancel_order',

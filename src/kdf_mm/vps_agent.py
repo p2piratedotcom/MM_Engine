@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import copy
 import secrets
 import sys
 import threading
@@ -92,14 +93,30 @@ def _owned_payload(order: object) -> dict[str, str | None]:
 def _orders_payload(controller, strategies):
     # One coherent read: a withdrawn order must not lose its strategy row.
     # Keep `orders` strictly actionable; strategy placeholders are display-only.
-    with strategies.lock if strategies is not None else nullcontext():
-        with controller._order_lock:
-            result = {"orders": [{**_owned_payload(order),
-                                  **(strategies.order_display(order) if strategies else {})}
-                                 for order in controller.ownership.active()]}
-            if strategies is not None:
-                result['strategy_states'] = strategies.status()
-            return result
+    locks = [strategies.lock] if strategies is not None else []
+    locks.append(controller._order_lock)
+    acquired = []
+    try:
+        for lock in locks:
+            if not lock.acquire(timeout=0.05):
+                cached = getattr(controller, '_dashboard_snapshot', None)
+                if cached is None:
+                    raise TimeoutError('Order state is being updated; retry shortly')
+                return {**copy.deepcopy(cached), 'refresh_pending': True}
+            acquired.append(lock)
+        result = {"orders": [{**_owned_payload(order),
+                              **(strategies.order_display(order) if strategies else {})}
+                             for order in controller.ownership.active()],
+                  'observed_at_ms': time.time_ns() // 1000000,
+                  'refresh_pending': False}
+        if strategies is not None:
+            result['strategy_states'] = strategies.status()
+        controller._dashboard_snapshot = copy.deepcopy(result)
+        return result
+    finally:
+        for lock in reversed(acquired):
+            lock.release()
+
 
 
 def handler_factory(
@@ -345,10 +362,10 @@ def handler_factory(
                 market["feed"] = feed_payload
                 self._json(200, market)
             elif path == "/v1/orders":
-                self._json(
-                    200,
-                    _orders_payload(controller, strategies),
-                )
+                try:
+                    self._json(200, _orders_payload(controller, strategies))
+                except TimeoutError as exc:
+                    self._json(503, {"error": str(exc)})
             else:
                 self._json(404, {"error": "not found"})
 
@@ -768,6 +785,7 @@ def build_controller(
         rpc_url=settings.kdf_rpc_url,
         userpass=settings.kdf_rpc_userpass,
         orders_enabled=settings.kdf_order_writes,
+        diagnostic_path=str(state_path.parent / "kdf-rpc-diagnostics.jsonl"),
     )
     markets = select_market_specs(
         settings.markets,

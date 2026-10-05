@@ -110,6 +110,9 @@ class MexcPublicFeed:
             self.client.order_book, self.symbol, deadline=book_deadline,
             limit=self.depth_limit,
         ))
+        # Metadata can expire while a depth request is in flight. Recheck it
+        # without extending its timestamp; a fresh book alone is insufficient.
+        ticker = self._stage('ticker_24h_final', lambda: self._ticker_24h(metadata_deadline))
         if not book.bids or not book.asks:
             raise MexcPublicFeedError(f"{self.venue} returned an incomplete order book")
         try:
@@ -133,6 +136,7 @@ class MexcPublicFeed:
             "bids": [[str(level.price), str(level.quantity)] for level in book.bids],
             "asks": [[str(level.price), str(level.quantity)] for level in book.asks],
             "base_volume_24h": str(volume),
+            "volume_observed_at_ms": ticker['_observed_at_ms'],
             "buy_capacity_arrr": str(
                 sum((level.quantity for level in book.asks), start=Decimal("0"))
             ),
@@ -263,6 +267,7 @@ class MexcPublicFeed:
 
     def _refresh_ticker(self, deadline):
         with self._metadata_lock:
+            requested_at_ms = self.clock_ms()
             ticker = self._read(self._metadata_client.ticker_24h, self.symbol, deadline=deadline)
             try:
                 volume = Decimal(str(ticker["volume"]))
@@ -271,23 +276,30 @@ class MexcPublicFeed:
             except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
                 raise MexcPublicFeedError(f"{self.venue} reported invalid 24h volume") from exc
             with self._lock:
-                self._ticker = ticker
-                self._ticker_at_ms = self.clock_ms()
-            return ticker
+                self._ticker = {**ticker, '_observed_at_ms': requested_at_ms}
+                self._ticker_at_ms = requested_at_ms
+                return self._ticker
 
     def _run_metadata(self) -> None:
+        failures = 0
         while not self._stop.is_set():
             try:
                 self._symbol_rules(time.monotonic() + 12.0)
                 # Refresh ahead of the unchanged 15-second volume TTL, with
                 # a bounded request on a reader independent from order books.
                 self._refresh_ticker(time.monotonic() + 4.0)
+                failures = 0
             except Exception:
+                failures += 1
                 # A failed refresh does not extend the cached data's lifetime.
                 # fetch_once/status and the existing circuit breaker expose
                 # expired data and withdraw unprotected orders normally.
                 pass
-            self._stop.wait(5.0)
+            # A fixed five-second sleep after a four-second timeout allowed
+            # two transient failures to exhaust the unchanged 15-second TTL.
+            # Retry promptly, then back off during a sustained outage.
+            delay = 5.0 if not failures else min(5.0, 0.5 * 2 ** min(failures - 1, 4))
+            self._stop.wait(delay)
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -299,7 +311,11 @@ class MexcPublicFeed:
                     self._consecutive_failures += 1
                     self._last_error = f"{type(exc).__name__}: {exc}"
             elapsed = time.monotonic() - started
-            self._stop.wait(max(0.1, self.interval_seconds - elapsed))
+            with self._lock:
+                failures = self._consecutive_failures
+            delay = self.interval_seconds if not failures else min(
+                self.interval_seconds, 0.5 * 2 ** min(failures - 1, 4))
+            self._stop.wait(delay if failures else max(0.1, delay - elapsed))
 
 
 class MexcPublicFeedGroup:
