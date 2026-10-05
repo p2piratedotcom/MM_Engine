@@ -20,7 +20,7 @@ def assert_no_pending(journal):
     db = sqlite3.connect('file:' + quote(str(path.resolve()), safe='/') + '?mode=ro', uri=True)
     try:
         if any(row[0] not in TERMINAL for row in db.execute('SELECT state FROM orders')):
-            raise ValueError('Rebalance CEX pendente: aprire [8], scegliere il CEX e aggiornare lo stato prima di ripartire')
+            raise ValueError('Rebalance CEX pendente: aprire Trading Engine → MY CEXs → Refresh trade status (oppure [8] nella TUI) prima di ripartire')
     finally:
         db.close()
 

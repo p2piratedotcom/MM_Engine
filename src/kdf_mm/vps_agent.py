@@ -71,6 +71,7 @@ WALLET_POST_PATHS = frozenset({
     "/v1/strategies/start-all", "/v1/strategies/pause-all",
     "/v1/strategies/scale", "/v1/reconciliation/run",
     "/v1/engine/shutdown", "/v1/credentials/store",
+    "/v1/rebalance/analyze", "/v1/rebalance/execute", "/v1/rebalance/status",
 })
 
 
@@ -133,6 +134,7 @@ def handler_factory(
     coverage: CoverageGuard | None = None,
     strategies=None,
     wallet_send=None,
+    wallet_rebalance=None,
     wallet_mode: bool = False,
     cex_profile: str = "default",
     wallet_live_enabled: bool = False,
@@ -168,6 +170,7 @@ def handler_factory(
                                  "kdf_owner": "wallet", "venues": list(supported_venues()),
                                  "plugin_protocol": 1,
                                  "plugins_external": installed_plugins() is not None,
+                                 "rebalance": wallet_rebalance is not None,
                                  "live_enabled": wallet_live_enabled})
             elif path == "/v1/exchanges/balances" and wallet_mode:
                 try:
@@ -377,7 +380,10 @@ def handler_factory(
             if not self._authenticated():
                 return
             from .rebalance_guard import rebalance_guard
-            if urlparse(self.path).path.startswith('/v1/wallet/send/'):
+            if (urlparse(self.path).path.startswith('/v1/wallet/send/')
+                    or urlparse(self.path).path in {'/v1/rebalance/analyze', '/v1/rebalance/execute', '/v1/rebalance/status'}):
+                # Execute takes its own EXCLUSIVE gate; status must remain
+                # reachable while an uncertain rebalance blocks publication.
                 self._post_authenticated()
                 return
             # Safety actions remain available even while a rebalance is unresolved.
@@ -402,7 +408,14 @@ def handler_factory(
             try:
                 payload = self._body()
                 path = urlparse(self.path).path
-                if path == "/v1/engine/shutdown" and wallet_mode:
+                if path in {'/v1/rebalance/analyze', '/v1/rebalance/execute', '/v1/rebalance/status'} and wallet_mode:
+                    if wallet_rebalance is None:
+                        raise ValueError('Ribilanciamento non disponibile: aggiornare il motore')
+                    method = {'/v1/rebalance/analyze': wallet_rebalance.analyze,
+                              '/v1/rebalance/execute': wallet_rebalance.execute,
+                              '/v1/rebalance/status': wallet_rebalance.status}[path]
+                    result = method(payload)
+                elif path == "/v1/engine/shutdown" and wallet_mode:
                     result = {"stopping": True}
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
                 elif path == "/v1/credentials/store" and wallet_mode:
@@ -418,7 +431,11 @@ def handler_factory(
                             or not 1 <= len(api_secret) <= 512):
                         raise ValueError("credenziali o conferma non valide")
                     keyring = LinuxSecretService(profile=cex_profile)
-                    keyring.store(venue, MexcCredentials(api_key, api_secret))
+                    if wallet_rebalance is not None:
+                        wallet_rebalance.store_credentials(venue,
+                            lambda: keyring.store(venue, MexcCredentials(api_key, api_secret)))
+                    else:
+                        keyring.store(venue, MexcCredentials(api_key, api_secret))
                     result = {"stored": venue}
                 elif path.startswith('/v1/wallet/send/'):
                     if wallet_send is None:
@@ -983,6 +1000,9 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
     from .wallet_send import WalletSend
     wallet_send = WalletSend(controller, strategies, repricing, settings.desktop_journal_db,
                              enabled=settings.live_transfers)
+    from .wallet_rebalance import WalletRebalance
+    wallet_rebalance = WalletRebalance(controller, strategies, reconciliation,
+        repricing, settings, profile=mexc_profile) if wallet_mode else None
     worker_token = secrets.token_urlsafe(48) if wallet_mode and with_mexc else None
     server = ThreadingHTTPServer(
         (settings.agent_bind, settings.agent_port),
@@ -999,6 +1019,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
             coverage=coverage,
             strategies=strategies,
             wallet_send=wallet_send,
+            wallet_rebalance=wallet_rebalance,
             wallet_mode=wallet_mode,
             wallet_worker_token=worker_token,
             cex_profile=mexc_profile,

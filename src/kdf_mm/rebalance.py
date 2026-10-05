@@ -27,14 +27,14 @@ RESERVE = D('1.20')
 TERMINAL = {'FILLED', 'CANCELED', 'PARTIALLY_CANCELED', 'REJECTED', 'EXPIRED'}
 
 
-def agent_context(controller, strategies, reconciliation, repricing):
+def agent_context(controller, strategies, reconciliation, repricing, *, include_wallet=True):
     if strategies is None or reconciliation is None or not controller.rebalance_lock_path:
         raise ValueError('Contesto rebalance locale non configurato')
     rows = strategies.status()['strategies']
     tickers = sorted({s['spec'][r]['ticker'] for s in rows for r in ('base', 'quote')})
     from .vps_controller import _numeric_decimal
     wallet = {}
-    for ticker in tickers:
+    for ticker in tickers if include_wallet else ():
         try:
             wallet[ticker] = {'free': str(_numeric_decimal(controller.kdf.max_maker_volume(ticker), 'volume'))}
         except Exception:
@@ -74,7 +74,8 @@ def fingerprint(context):
     # Ignore volatile confirmations, previews and log details, not quantities/budgets.
     rows = [{'spec': r['spec'], 'remaining': r['remaining_sold'], 'enabled': r['enabled'],
              'state': r['state']} for r in context['strategies']]
-    return hashlib.sha256(json.dumps({'rows': rows, 'fee': context['fee'], 'buffer': context['buffer'],
+    return hashlib.sha256(json.dumps({'rows': rows, 'open_quotes': context.get('open_quotes', []),
+        'fee': context['fee'], 'buffer': context['buffer'],
         'daily_fraction': context['daily_fraction']}, sort_keys=True).encode()).hexdigest()
 
 
@@ -193,6 +194,27 @@ def coverage_targets(context, snapshots, *, warnings=None, excluded=None):
             qty = (qty / step).to_integral_value(rounding=ROUND_CEILING) * step
             asset = 'USDT' if leg['side'] == 'BUY' else leg['asset']
             cex[asset] += qty * (D(leg['limit_price']) if asset == 'USDT' else 1) * (1 + fee)
+    opened = defaultdict(D)
+    specs = {row['id']: StrategySpec.from_payload(row['spec']) for row in context['strategies']}
+    for quote in context.get('open_quotes', []):
+        spec = specs.get(quote['strategy_id'])
+        if spec is None:
+            continue
+        sold = number(quote['volume'], 'quantità pubblicata')
+        bought = sold * number(quote['price'], 'prezzo pubblicato')
+        for route, side, amount in ((spec.sold, 'BUY', sold), (spec.bought, 'SELL', bought)):
+            if not route.symbol:
+                continue
+            snapshot = snapshots[route.symbol]
+            if side == 'BUY':
+                amount = (amount / snapshot.quantity_step).to_integral_value(rounding=ROUND_CEILING) * snapshot.quantity_step
+                asset = 'USDT'
+                amount *= snapshot.order_book().asks[0].price * (1 + spec.impact)
+            else:
+                asset = route.asset
+            opened[asset] += amount * (1 + fee)
+    for asset, amount in opened.items():
+        cex[asset] = max(cex[asset], amount)
     return ({a: q * RESERVE for a, q in cex.items()},
             {a: max(pairs.values()) for a, pairs in pools.items()}, routes)
 
@@ -275,7 +297,7 @@ def propose(context, snapshots, balances):
     if any(free.get(a, D(0)) < required for a, required in targets.items()):
         remaining = {a: D(0) for a in remaining}
         notes.append(f'Prima completare la copertura +20% su {venue}; nessuna eccedenza trasferibile finché esistono deficit.')
-    for ticker, needed in sorted(kdf.items()):
+    for ticker, needed in sorted(kdf.items()) if context.get('include_transfers', True) else ():
         wallet = context['wallet'].get(ticker, {})
         if 'free' not in wallet:
             notes.append(f'{ticker}: saldo KDF non disponibile; trasferimento non calcolabile')
@@ -340,6 +362,7 @@ def _venue_context(context, venue, fee):
     ]
     result['fee'] = str(fee)
     result['venue'] = selected
+    result['open_quotes'] = [r for r in context.get('open_quotes', []) if r['cex'] == selected]
     return result
 
 
@@ -351,36 +374,48 @@ def _commission_payload(payload):
 
 
 class CexRebalanceService:
-    def __init__(self, api, settings, journal_path, *, venue='MEXC', profile='default', client=None):
+    def __init__(self, api, settings, journal_path, *, venue='MEXC', profile='default', client=None,
+                 strategy_ids=None):
         from .venues import normalize_cex
         self.api, self.settings, self.journal_path = api, settings, str(Path(journal_path).resolve())
         self.venue, self.profile, self._client = normalize_cex(venue), profile, client
+        self.strategy_ids = None if strategy_ids is None else frozenset(strategy_ids)
 
     @property
     def client(self):
         if self._client is None:
             from .credentials import LinuxSecretService
             secrets = LinuxSecretService(profile=self.profile)
-            if self.venue == 'GATE':
-                from .gate import GateClient
-                keys = secrets.load_gate()
-                self._client = GateClient(api_key=keys.api_key, api_secret=keys.api_secret,
-                    base_url=self.settings.gate_base_url, trading_enabled=self.settings.live_trading)
-            else:
-                from .mexc import MexcClient
-                keys = secrets.load_mexc()
-                self._client = MexcClient(api_key=keys.api_key, api_secret=keys.api_secret,
-                    base_url=self.settings.mexc_base_url, trading_enabled=self.settings.live_trading,
-                    transfers_enabled=False)
+            from .exchanges import private_client
+            self._client = private_client(self.venue, secrets,
+                base_url=getattr(self.settings, self.venue.lower() + '_base_url', None),
+                trading_enabled=self.settings.live_trading)
         return self._client
 
     @property
     def configured_fee(self):
+        from .exchanges.plugin_catalog import installed_plugins
+        if installed_plugins() is not None:
+            from .exchanges import load_config
+            return D(load_config(self.venue).taker_fee)
         return (getattr(self.settings, 'gate_taker_fee', D('0.002')) if self.venue == 'GATE'
                 else getattr(self.settings, 'cex_taker_fee', D('0.001')))
 
+    def _context(self, full_context):
+        context = _venue_context(full_context, self.venue, self.configured_fee)
+        if self.strategy_ids is not None:
+            context['strategies'] = [r for r in context['strategies'] if r['id'] in self.strategy_ids]
+            if {r['id'] for r in context['strategies']} != self.strategy_ids:
+                raise ValueError('Ordini maker cambiati o eliminati: ricalcolare')
+            context['open_quotes'] = [r for r in context['open_quotes'] if r['strategy_id'] in self.strategy_ids]
+        return context
+
+    def _synchronize(self):
+        from .exchanges import load_config
+        self.client.synchronize_time(max_round_trip_ms=load_config(self.venue).time_sync_budget_ms)
+
     def balances(self):
-        self.client.synchronize_time()
+        self._synchronize()
         result = free_balances(self.client.account(), venue=self.venue)
         return {'at': time.strftime('%H:%M:%S'), 'balances': {
             a: {k: str(v) for k, v in b.items()} for a, b in result.items() if any(b.values())}}
@@ -415,11 +450,11 @@ class CexRebalanceService:
             return ()
 
     def preview(self):
-        self.client.synchronize_time()
+        self._synchronize()
         full_context = self.api.get('/v1/rebalance/context')
         if full_context['repricing'].get('quotes'):
             raise ValueError('Sono presenti quotazioni legacy: rimuoverle o convertirle in strategie prima del rebalance')
-        context = _venue_context(full_context, self.venue, self.configured_fee)
+        context = self._context(full_context)
         started = time.time()
         balances = free_balances(self.client.account(), venue=self.venue)
         snapshots = {}
@@ -434,19 +469,27 @@ class CexRebalanceService:
                              for k in ('makerCommission', 'takerCommission'))
             if actual_fee > D(context['fee']):
                 raise ValueError(f'{symbol}: commissione {self.venue} maggiore di quella configurata; aggiornare il margine commissioni')
+            book_started_ms = time.time_ns() // 1000000
             book = self.client.order_book(symbol, limit=self.settings.mexc_depth_limit)
+            ticker_started_ms = time.time_ns() // 1000000
             ticker = self.client.ticker_24h(symbol)
-            snapshots[symbol] = MarketSnapshot(0, symbol, int(time.time() * 1000),
+            snapshots[symbol] = MarketSnapshot(0, symbol, book_started_ms,
                 tuple((str(l.price), str(l.quantity)) for l in book.bids),
                 tuple((str(l.price), str(l.quantity)) for l in book.asks),
                 number(ticker['volume'], 'volume', positive=False), D(0), D(0),
-                rules.quantity_step, rules.price_step, rules.min_quote_amount, 'local-read')
+                rules.quantity_step, rules.price_step, rules.min_quote_amount, 'local-read',
+                volume_observed_at_ms=ticker_started_ms)
         if time.time() - started > 30:
             raise ValueError(f'Lettura {self.venue} troppo lenta: riprovare, nessun piano valido')
+        now_ms = time.time_ns() // 1000000
+        if any(now_ms - s.observed_at_ms > 10000 or now_ms - s.volume_observed_at_ms > 15000
+               for s in snapshots.values()):
+            raise ValueError('Dati di mercato scaduti durante l’analisi: riprovare')
         result = propose(context, snapshots, balances)
         from .hedge_unwind import protect_failed_hedge_inventory
         permitted = []
         for item in result['orders']:
+            item['cex'] = self.venue
             try:
                 protect_failed_hedge_inventory(
                     self.journal_path,
@@ -465,6 +508,7 @@ class CexRebalanceService:
         for item in result['orders']:
             item['cex'] = self.venue
         result['cex'] = self.venue
+        result['market_observed_ms'] = min((s.observed_at_ms for s in snapshots.values()), default=0)
         result.update(id=uuid.uuid4().hex, expires=started + 120, at=time.strftime('%H:%M:%S'))
         return result
 
@@ -485,7 +529,7 @@ class CexRebalanceService:
             full_context = self.api.get('/v1/rebalance/context')
             assert_idle(full_context, self.journal_path)
             assert_no_pending(self.journal_path)
-            context = _venue_context(full_context, self.venue, self.configured_fee)
+            context = self._context(full_context)
             if fingerprint(context) != plan['fingerprint']:
                 raise ValueError('Strategie cambiate durante l’analisi: ricalcolare')
         except ValueError as exc:
@@ -504,7 +548,15 @@ class CexRebalanceService:
                 if str(order.get('cex', 'MEXC')).upper() != self.venue:
                     continue
                 result = self.client.query_order(symbol=order['symbol'], client_order_id=oid)
+                if (not isinstance(result, dict) or result.get('clientOrderId') != oid
+                        or result.get('symbol') != order['symbol']
+                        or result.get('side') != order['side']
+                        or number(result.get('origQty'), 'quantità ordine') != D(order['quantity'])):
+                    raise ValueError('Identità rebalance CEX non verificabile: conservare il blocco e aggiornare lo stato')
                 state = str(result.get('status', 'UNKNOWN'))
+                filled = number(result.get('executedQty'), 'quantità eseguita', positive=False)
+                if filled > D(order['quantity']) or (state == 'FILLED' and filled != D(order['quantity'])):
+                    raise ValueError('Esito rebalance discordante: conservare il blocco e aggiornare lo stato')
                 db.execute('UPDATE orders SET state=?,result=? WHERE id=?', (state, json.dumps(result), oid))
                 db.commit()
             return [{'id': row[0], 'order': json.loads(row[1]), 'state': row[2]} for row in
@@ -526,7 +578,7 @@ class CexRebalanceService:
         with rebalance_guard(self.journal_path + '.rebalance.lock', exclusive=True), rebalance_worker_access(self.journal_path):
             full_context = self.api.get('/v1/rebalance/context')
             assert_idle(full_context, self.journal_path)
-            context = _venue_context(full_context, self.venue, self.configured_fee)
+            context = self._context(full_context)
             if fingerprint(context) != plan['fingerprint']:
                 raise ValueError('Strategie cambiate: ricalcolare la proposta')
             fresh = self.preview()
@@ -561,6 +613,9 @@ class CexRebalanceService:
                 fee,
                 refunded_swap_uuids=self._refunded_swap_uuids(context),
             )
+            if (time.time() > plan['expires'] or time.time() > fresh['expires'] - 90
+                    or time.time_ns() // 1000000 - fresh.get('market_observed_ms', 0) > 10000):
+                raise ValueError('Mercato scaduto durante le verifiche finali: ricalcolare e confermare di nuovo')
             db = self._db()
             oid = 'rb' + plan['id'][:28]
             try:
@@ -573,7 +628,9 @@ class CexRebalanceService:
                 try:
                     response = self.client.place_limit_order(symbol=item['symbol'], side=HedgeSide(item['side']),
                         quantity=D(item['quantity']), price=D(item['price']), client_order_id=oid)
-                    state = str(response.get('status', 'UNKNOWN'))
+                    # An ACK is not fill proof. Only a later identity-checked
+                    # query may release the durable publication/worker guard.
+                    state = 'SUBMITTED'
                     db.execute('UPDATE orders SET state=?,result=? WHERE id=?', (state, json.dumps(response), oid))
                     db.commit()
                 except Exception:

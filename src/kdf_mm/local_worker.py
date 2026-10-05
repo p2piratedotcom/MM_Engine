@@ -24,7 +24,8 @@ class WorkerLock:
     def __enter__(self):
         from .rebalance_guard import rebalance_guard
         gate = (nullcontext() if self.rebalance else
-                rebalance_guard(str(self.path).removesuffix('.worker.lock') + '.rebalance.lock'))
+                rebalance_guard(str(self.path).removesuffix('.worker.lock') + '.rebalance.lock',
+                                exclusive=self.cooperative))
         with gate:
             return self._acquire()
 
@@ -38,7 +39,11 @@ class WorkerLock:
             raise WorkerBusyError("un worker MEXC/GATE usa già questo journal; aggiornare il servizio per consentire il riequilibrio coordinato") from None
         try:
             from .rebalance_guard import assert_no_pending
-            assert_no_pending(str(self.path).removesuffix('.worker.lock'))
+            # A cooperative worker may initialize so the wallet can query an
+            # uncertain rebalance after restart. EVERY operational cycle still
+            # passes coordinated_cycle's shared gate and assert_no_pending.
+            if not self.cooperative:
+                assert_no_pending(str(self.path).removesuffix('.worker.lock'))
         except Exception:
             self.file.close()
             raise
