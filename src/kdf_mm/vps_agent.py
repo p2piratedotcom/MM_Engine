@@ -171,6 +171,7 @@ def handler_factory(
                                  "plugin_protocol": 1,
                                  "plugins_external": installed_plugins() is not None,
                                  "rebalance": wallet_rebalance is not None,
+                                 "rebalance_selection": 1 if wallet_rebalance is not None else 0,
                                  "live_enabled": wallet_live_enabled})
             elif path == "/v1/exchanges/balances" and wallet_mode:
                 try:

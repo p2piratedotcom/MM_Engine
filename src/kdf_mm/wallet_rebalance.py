@@ -65,13 +65,14 @@ class WalletRebalance:
                     'price': str(order.kdf_price)})
             return result
 
-    def _service(self, venue, ids=None, *, execution=False):
+    def _service(self, venue, ids=None, *, execution=False, asset_percentages=None, allocation_id=None):
         # Analysis/status share the read-only credential lane, leaving the
         # live hedge client's pool free. Execution runs under the exclusive
         # gate, where operational worker cycles cannot overlap it.
         settings = self.settings if execution else replace(self.settings, live_trading=False)
         return CexRebalanceService(self._api, settings, self.journal,
-            venue=venue, profile=self.profile, strategy_ids=ids)
+            venue=venue, profile=self.profile, strategy_ids=ids,
+            asset_percentages=asset_percentages, allocation_id=allocation_id)
 
     def store_credentials(self, venue, store):
         # A proposal belongs to the account whose balance was analyzed.
@@ -79,6 +80,8 @@ class WalletRebalance:
         with self._operation():
             self._plans = {pid: value for pid, value in self._plans.items()
                            if value[0]['cex'] != venue}
+            from .rebalance_allocation import invalidate
+            invalidate(self._service(venue))
             store()
 
     def _blockers(self, context):
@@ -113,7 +116,20 @@ class WalletRebalance:
                 ids = set(supplied)
             if not ids:
                 raise ValueError('Nessun ordine maker configurato per questo CEX')
-            service = self._service(venue, ids)
+            policy = None
+            allocation_id = payload.get('allocation_id')
+            if 'asset_percentages' in payload:
+                from .rebalance_allocation import percentages
+                policy = percentages(payload['asset_percentages'])
+                if supplied is None:
+                    raise ValueError('Selezionare esplicitamente gli ordini maker')
+                if allocation_id is not None and (not isinstance(allocation_id, str) or len(allocation_id) != 32):
+                    raise ValueError('Identità budget CEX non valida')
+            elif allocation_id is not None:
+                raise ValueError('Percentuali del budget CEX mancanti')
+            if policy is not None and allocation_id is None:
+                self._plans = {key: value for key, value in self._plans.items() if value[0]['cex'] != venue}
+            service = self._service(venue, ids, asset_percentages=policy, allocation_id=allocation_id)
             plan = service.preview()
             plan['strategy_ids'] = sorted(ids)
             plan['maker_orders'] = []
@@ -146,7 +162,10 @@ class WalletRebalance:
             if stored is None or stored[0]['cex'] != venue:
                 raise ValueError('Proposta assente, già utilizzata o servizio riavviato: ricalcolare')
             plan, ids = self._plans.pop(pid)
-            service = self._service(venue, ids, execution=True)
+            allocation = plan.get('allocation')
+            service = self._service(venue, ids, execution=True,
+                asset_percentages=allocation['percentages'] if allocation else None,
+                allocation_id=allocation['id'] if allocation else None)
             message = service.execute_first(plan)
             return {'message': message, 'orders': self._history(service), 'reanalyze_required': True}
 
@@ -179,4 +198,11 @@ class WalletRebalance:
             except Exception:
                 # Signed URLs/exchange payloads must never enter wallet errors.
                 errors.append('Esito CEX non verificabile ora. Non reinviare: riprovare Aggiorna stato.')
-            return {'venue': venue, 'orders': self._history(service), 'errors': errors}
+            from .rebalance_allocation import latest
+            try:
+                allocation = latest(service)
+            except Exception:
+                allocation = None
+                errors.append('Budget CEX non verificabile: risolvere lo stato prima di una nuova esecuzione.')
+            return {'venue': venue, 'orders': self._history(service), 'errors': errors,
+                    'allocation': allocation}

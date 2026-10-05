@@ -1,3 +1,8 @@
+> The new GUI uses [selected maker/coin rebalance](SELECTED_REBALANCE.md) in
+> its separate CEX REBALANCE card. The implicit scope described below remains
+> the legacy TUI/API policy. GUI requests add `asset_percentages` and optional
+> `allocation_id`; repeated Analyze preserves absolute spending envelopes.
+
 # Spot rebalance in P2Pirate Desktop
 
 The wallet uses the same `CexRebalanceService` policy as the TUI through the
