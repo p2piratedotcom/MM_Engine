@@ -1,5 +1,6 @@
 """Local strategy orchestration. Does not own KDF or MEXC private keys."""
 from __future__ import annotations
+from types import SimpleNamespace
 
 import json
 import logging
@@ -10,7 +11,7 @@ from decimal import Decimal, ROUND_CEILING
 from typing import Any, Mapping
 
 from .market_data import MarketDataStore
-from .kdf import KdfPreflightError
+from .kdf import KdfPreflightError, KdfRpcClient
 from .markets import MarketSpec
 from .models import DexSide, HedgeSide
 from .ownership import OwnedOrderStatus, OwnedSwapState
@@ -26,7 +27,7 @@ from .strategy import (
     opposite_spec,
 )
 from .strategy_store import StrategyStore
-from .vps_controller import _numeric_decimal, HedgeDepthError
+from .vps_controller import _numeric_decimal, HedgeDepthError, KdfCoinStateUnavailable
 from .venues import coverage_asset_key, market_data_key, normalize_cex
 
 D = Decimal
@@ -37,11 +38,12 @@ LOG = logging.getLogger(__name__)
 
 class StrategyService:
     def __init__(self, *, controller, store: StrategyStore, feed_group, public_client=None,
-                 public_clients=None,
+                 public_clients=None, public_client_factory=None,
                  venue_fees=None, preview_balances=None,
                  reconciliation, repricing, clock=time.time, settlement=None) -> None:
         self.controller, self.store, self.feeds = controller, store, feed_group
         self.preview_balances = preview_balances
+        self.public_client_factory = public_client_factory
         clients = dict(public_clients or {})
         # None remains a supported injected test/offline adapter when all
         # required snapshots are already present in the controller.
@@ -78,6 +80,7 @@ class StrategyService:
         controller.strategy_min_volume = self.minimum_volume
         controller.strategy_siblings = self.allow_siblings
         controller.note_strategy_withdrawal = store.note_safety_withdrawal
+        controller.cancellation_resume_requested = lambda sid: bool(self.store.get(sid)['enabled'])
 
     @staticmethod
     def _key(spec: StrategySpec, symbol: str) -> str:
@@ -175,7 +178,9 @@ class StrategyService:
                 data = MarketDataStore(symbol=route.symbol, secret=template.secret,
                                        clock_ms=template.clock_ms, max_age_ms=template.max_age_ms)
                 feed = MexcPublicFeed(client=client, store=data, snapshot_secret=template.secret,
-                                      symbol=route.symbol, venue=spec.cex)
+                                      symbol=route.symbol, venue=spec.cex,
+                                      client_factory=(lambda venue=spec.cex: self.public_client_factory(venue))
+                                      if self.public_client_factory else None)
                 self.feeds.add(key, feed)
                 c.market_data_by_symbol = {**c.market_data_by_symbol, key: data}
             if validate and self.feeds is not None:
@@ -201,6 +206,12 @@ class StrategyService:
                 remaining, daily = self.store.remaining(spec)
                 row["remaining_sold"] = str(remaining) if remaining is not None else "automatico"
                 row["daily_remaining_sold"] = str(daily) if daily is not None else "nessun limite"
+                pending = self.controller.cancellations.pending(row['id'])
+                if pending:
+                    checked = self._recovery_checked.get(('cancel', row['id']), time.monotonic() - 10)
+                    row['recovery'] = {'operation': 'cancel_order',
+                        'held': any(i['state'] == 'HELD' for i in pending),
+                        'next_retry_seconds': max(0, round(10 - (time.monotonic() - checked)))}
             return {"schema_version": 1, "strategies": rows, "local_first": True,
                     "worker_running": bool(self.thread and self.thread.is_alive())}
 
@@ -616,7 +627,14 @@ class StrategyService:
             row = self.store.get(strategy_id)
             if row["state"] == "DELETED":
                 raise ValueError("strategia eliminata: creare una nuova configurazione")
-            if enabled and row["state"] in {"WRITING", "REVIEW_REQUIRED"}:
+            if not enabled:
+                self.controller.cancellations.hold(strategy_id)
+                if self.controller.cancellations.pending(strategy_id):
+                    self.store.update(strategy_id, enabled=0, state='REVIEW_REQUIRED',
+                        detail='Pausa manuale: recupero della cancellazione sospeso')
+                    row = self.store.get(strategy_id)
+            if enabled and (row["state"] in {"WRITING", "REVIEW_REQUIRED"}
+                            or self.controller.cancellations.pending(strategy_id)):
                 if row['detail'].startswith(LEGACY_UPDATE_TIMEOUT):
                     raise ValueError(f"riconciliazione automatica KDF non conclusa: {row['detail']}")
                 raise ValueError("scrittura incerta: riconciliazione manuale richiesta")
@@ -658,6 +676,11 @@ class StrategyService:
                            if not row["enabled"] and row["state"] == "PAUSED"]
             else:
                 targets = [row["id"] for row in rows if row["enabled"]]
+            if not enabled:
+                # Disabled recovering rows are deliberately absent from targets;
+                # a global stop must nevertheless revoke their resume intent.
+                targets = list(dict.fromkeys([*targets, *(row['id'] for row in rows
+                    if self.controller.cancellations.pending(row['id']))]))
             changed, errors = [], []
             for strategy_id in targets:
                 try:
@@ -746,6 +769,8 @@ class StrategyService:
                     continue
                 if self._recover_legacy_update(spec, row):
                     continue
+                if self._recover_cancel(spec, row):
+                    continue
                 if self._recover_completed_swap_review(spec, row):
                     continue
                 if not row["enabled"]:
@@ -775,6 +800,13 @@ class StrategyService:
                         raise RuntimeError("scrittura precedente incerta")
                     self._cycle(spec, row)
                 except Exception as exc:
+                    if isinstance(exc, KdfCoinStateUnavailable) and exc.snapshot_age <= 8.0:
+                        # Brief unknown activation state freezes quoting. The
+                        # independent market/coverage guards still protect OPEN
+                        # orders; after the bounded snapshot age, cancel safely.
+                        self.store.update(spec.strategy_id, state='RECOVERING',
+                            detail='KDF coin state temporarily unavailable; publication paused, snapshot refresh in progress')
+                        continue
                     if self.store.update_intent(spec.strategy_id):
                         # update_maker_order may have applied even if its reply
                         # was lost. Never submit the same volume_delta again.
@@ -790,7 +822,8 @@ class StrategyService:
                         try:
                             self._cancel(spec, reason=str(exc) or type(exc).__name__, source='strategy_safety')
                         except Exception as cancel_error:
-                            self.store.update(spec.strategy_id, enabled=0, state="REVIEW_REQUIRED", detail=str(cancel_error))
+                            self.store.update(spec.strategy_id, enabled=0, state="RECOVERING",
+                                detail='Cancellation response uncertain; checking KDF automatically every 10 seconds')
                             continue
                         self.store.update(spec.strategy_id, state="WAITING", detail=str(exc), confirmations=0, evidence="null", preview="{}")
 
@@ -1000,6 +1033,117 @@ class StrategyService:
                 detail=f'Pubblicazione incerta: {exc}. Nessun reinvio; verifica in sola lettura ogni 10 s.')
         return True
 
+    def _recover_cancel(self, spec, row):
+        journal = self.controller.cancellations
+        bound = self.store.orders_for_strategy(spec.strategy_id)
+        if (not row['enabled'] and row['state'] == 'REVIEW_REQUIRED'
+                and row['detail'].startswith('KDF RPC cancel_order:') and bound
+                and not self.store.update_intent(spec.strategy_id)
+                and not self.controller.publications.pending(spec.strategy_id)
+                and not self.controller.ownership.swaps_for_order(bound[0])):
+            journal.import_legacy(bound[0], spec.strategy_id)
+        intents = journal.pending(spec.strategy_id)
+        if not intents:
+            return False
+        held = any(i['state'] == 'HELD' for i in intents)
+        if self.store.update_intent(spec.strategy_id) or self.controller.publications.pending(spec.strategy_id):
+            return True
+        now = time.monotonic()
+        key = ('cancel', spec.strategy_id)
+        if now - self._recovery_checked.get(key, float('-inf')) < 10:
+            return True
+        self._recovery_checked[key] = now
+        try:
+            for intent in intents:
+                uid = intent['order_uuid']
+                owned = self.controller.ownership.get(uid)
+                if not owned or self.store.strategy_for_order(uid) != spec.strategy_id:
+                    raise ValueError('cancellation UUID ownership mismatch')
+                if self.controller.ownership.swaps_for_order(uid):
+                    if held:
+                        return True
+                    # Existing settlement recovery owns these cases. Never
+                    # erase a swap/hedge review by treating it as a plain cancel.
+                    journal.state(uid, 'DELEGATED')
+                    self.store.update(spec.strategy_id, enabled=0, state='REVIEW_REQUIRED',
+                        detail='KDF RPC cancel_order: swap settlement verification required')
+                    return True
+                kdf = self.controller.kdf
+                snapshot = kdf._maker_order_snapshot(timeout=2.0)
+                live = snapshot.get(uid)
+                if live is not None:
+                    if (live.get('uuid') != uid or live.get('base') != owned.kdf_base
+                            or live.get('rel') != owned.kdf_rel
+                            or not isinstance(live.get('matches'), Mapping)
+                            or not isinstance(live.get('started_swaps'), list)
+                            or live['matches'] or live['started_swaps']):
+                        raise ValueError('live cancellation order has unknown identity or a match')
+                    if not held and time.time() - intent['requested_at'] >= 30 and kdf.orders_enabled:
+                        # Only retry cancellation of this freshly verified owned
+                        # UUID, never setprice/update_maker_order after a timeout.
+                        self.controller.cancel_owned_order(uid, strategy_id=spec.strategy_id,
+                            reason=intent['reason'], source=intent['source'])
+                    self.store.update(spec.strategy_id, enabled=0, state='REVIEW_REQUIRED' if held else 'RECOVERING',
+                        detail='Manual pause retained; owned UUID still visible in KDF' if held else
+                               'Owned UUID still visible in KDF; awaiting confirmed cancellation, no replacement published')
+                    return True
+                history = (kdf.order_status(uid, timeout=2.0) if isinstance(kdf, KdfRpcClient)
+                           else kdf.order_status(uid))
+                if not isinstance(history, Mapping):
+                    raise ValueError('KDF cancellation history missing')
+                order = history.get('order', history)
+                if not isinstance(order, Mapping):
+                    raise ValueError('KDF cancellation history incomplete')
+                reason = order.get('cancellation_reason', history.get('cancellation_reason'))
+                if isinstance(reason, Mapping):
+                    reason = reason.get('type') or reason.get('reason')
+                if (order.get('uuid') != uid or order.get('base') != owned.kdf_base
+                        or order.get('rel') != owned.kdf_rel
+                        or str(reason or '').replace('_', '').replace(' ', '').lower() != 'cancelled'
+                        or not isinstance(order.get('matches'), Mapping) or order['matches']
+                        or not isinstance(order.get('started_swaps'), list) or order['started_swaps']):
+                    raise ValueError('KDF history does not prove cancellation without swaps')
+                active = (kdf.active_swaps(include_status=False, timeout=2.0)
+                          if isinstance(kdf, KdfRpcClient) else kdf.active_swaps(include_status=False))
+                if not isinstance(active, Mapping) or not isinstance(active.get('uuids'), list) or active['uuids']:
+                    raise ValueError('active KDF swaps prevent cancellation recovery')
+                if any(other in snapshot for other in bound):
+                    raise ValueError('another bound UUID is still published')
+                if any(self.controller.ownership.get(other) is None
+                       or self.controller.ownership.get(other).status is OwnedOrderStatus.OPEN
+                       for other in bound if other != uid):
+                    raise ValueError('another bound order has unresolved ownership')
+                if owned.status is OwnedOrderStatus.OPEN:
+                    self.controller.ownership.mark(uid, OwnedOrderStatus.CANCELLED,
+                        error='Cancellation verified in KDF history without swaps',
+                        source='cancel_readback', strategy_id=spec.strategy_id)
+                    self.store.note_safety_withdrawal(spec.strategy_id, intent['source'])
+                elif owned.status is not OwnedOrderStatus.CANCELLED:
+                    raise ValueError('local order state conflicts with cancellation history')
+                block = self.reconciliation.block_quote(spec.market_id, spec.side)
+                if block:
+                    raise RuntimeError('KDF reconciliation still pending')
+            resume = all(i['resume_requested'] for i in intents)
+            # Strategy transition precedes DONE: a crash between writes leaves
+            # the intent pending and forces fresh proof again, never a blind write.
+            self.store.update(spec.strategy_id, enabled=int(resume), state='WAITING' if resume else 'PAUSED',
+                detail='Cancellation verified; waiting for fresh market, hedge coverage and cooldown' if resume
+                       else 'Cancellation verified; manual pause retained',
+                confirmations=0, evidence='null', preview='{}')
+            for intent in intents:
+                journal.state(intent['order_uuid'], 'DONE')
+                self.controller.ownership.record_order_event(intent['order_uuid'], 'CANCEL_TIMEOUT_RECOVERED',
+                    source='kdf_readback', strategy_id=spec.strategy_id,
+                    reason='Cancellation without swaps verified; no uncertain order update retried')
+        except (ValueError, KeyError) as exc:
+            self.store.update(spec.strategy_id, enabled=0, state='REVIEW_REQUIRED',
+                detail=f'Cancellation requires verification: {exc}')
+        except Exception:
+            self.store.update(spec.strategy_id, enabled=0, state='RECOVERING',
+                detail='Manual pause retained; KDF cancellation verification unavailable' if held else
+                       'KDF verification temporarily unavailable; next automatic read in 10 seconds')
+        return True
+
     def _recover_legacy_update(self, spec, row):
         """Release a pre-intent update timeout only after KDF proves cancellation.
 
@@ -1192,6 +1336,29 @@ class StrategyService:
             self.settlement(spec, self.store)
         block = self.reconciliation.block_quote(spec.market_id, spec.side)
         if block:
+            if getattr(self.reconciliation, "initialization_pending_for_quote", lambda *_: False)(spec.market_id, spec.side):
+                # Unknown active UUID: freeze writes for at most the reconciler's
+                # initialization grace. Independent exposure checks still run;
+                # an owned maker swap or persistent failure cannot use this path.
+                held_orders = self.orders_for(spec)
+                for existing in held_orders:
+                    if not {existing.kdf_base, existing.kdf_rel} <= set(c.enabled_tickers()):
+                        raise ValueError("coin non attive")
+                    c._assert_market_fresh(spec.market_id)
+                    c._assert_pool_capacity(SimpleNamespace(
+                        strategy_id=spec.strategy_id, inventory_pool=existing.inventory_pool,
+                        kdf_base=existing.kdf_base, kdf_rel=existing.kdf_rel,
+                        kdf_volume=existing.advertised_volume),
+                        excluding_order_uuid=existing.order_uuid)
+                    if c.coverage is None:
+                        raise ValueError("copertura hedge non disponibile")
+                    blocked = c.coverage.block_reason(c.coverage_requirements())
+                    if blocked:
+                        raise ValueError(blocked)
+                self.store.update(spec.strategy_id,
+                                  state="STABILIZING" if held_orders else "WAITING",
+                                  detail=block, confirmations=0, evidence="null")
+                return
             if "requires order reconciliation:" in block:
                 # A freshly accepted setprice can be absent from one my_orders
                 # snapshot. Keep its UUID reserved while the reconciler checks

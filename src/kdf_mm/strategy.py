@@ -82,8 +82,10 @@ class AssetRoute:
             not c.isalnum() and c not in "-_" for c in self.ticker + self.asset
         ):
             raise ValueError("ticker/asset non valido")
-        if self.ticker != self.ticker.upper() or self.asset != self.asset.upper():
-            raise ValueError("ticker/asset deve essere maiuscolo")
+        # KDF config IDs are case-sensitive (e.g. BTC-segwit). Exchange asset
+        # codes are a separate namespace and still require uppercase.
+        if self.asset != self.asset.upper():
+            raise ValueError("asset CEX deve essere maiuscolo")
         if self.symbol != (None if self.asset == "USDT" else self.asset + "USDT"):
             raise ValueError("la route deve essere Spot asset/USDT; USDT non usa un book")
 

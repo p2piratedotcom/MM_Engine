@@ -112,3 +112,98 @@ The existing TUI remains an operator client of the same service architecture.
 Its historical `local-service` command and state paths are unchanged by this
 adapter. Standalone operator use must supply its own KDF and coin registry;
 the extracted repository does not bundle those runtime assets.
+
+## Local live worker authentication
+
+The wallet service gives the local CEX worker a separate, random token for each
+process. Only that token can access `/v1/events`, `/v1/events/acknowledge`,
+`/v1/coverage/lease` and `/v1/coverage/publication-hold`. The GUI bearer token
+cannot acknowledge hedge events or renew coverage. KDF lifecycle, wallet-send
+and operator publication endpoints remain unavailable in wallet mode. The
+operator service keeps its existing authentication contract.
+
+The worker must synchronize signed events successfully before renewing the
+signed balance lease. A failed renewal continues to block new maker orders;
+this change does not bypass coverage checks or enable a paused strategy.
+Run `python -m unittest discover -s tests -p 'test_wallet*.py'` for the isolated
+wallet API checks.
+
+### Active swap initialization and maker reconciliation
+
+KDF 2.7 may expose an active swap UUID before its first durable `Started` status.
+The reconciler distinguishes the exact missing-file/matching missing-UUID legacy
+errors from arbitrary RPC failures. Unknown UUIDs get at most 30 seconds of
+initialization grace, with new publications and updates blocked. Known owned maker
+swaps never use that grace. Existing maker quotes are held only after a prior
+successful reconciliation and with independent fresh market, aggregate wallet
+capacity, hedge depth and CEX coverage checks. Persistent/other failures keep the
+normal withdrawal path. A durable wallet taker status needs no maker canonical
+lookup. `initializing_swap_uuids` makes this bounded wait observable; diagnostics
+include the failing UUID. No completed swap is inferred from missing data.
+
+Wallet strategy routes may be registered dynamically from active coin IDs. KDF
+IDs are preserved verbatim, including case-sensitive network suffixes; CEX asset
+codes and routes remain separate, uppercase, and validated during preview.
+
+
+### Public-reader isolation and maker uptime (4 October 2026)
+
+Wallet-created market feeds use `create_public_reader`, which bypasses the
+credentialed/pooled plugin client. Every market has its own read-only depth
+reader and a separate read-only metadata reader. The stdio plugin protocol
+serializes a client's requests; sharing one client across markets previously
+queued depth behind another symbol's slow 24h-ticker request. Sampled ticker
+latencies reached 12.1 s, while depth freshness remains limited to 10 s.
+
+The metadata worker refreshes rolling volume ahead of the existing 15 s cache
+expiry. Depth reads continue independently. Metadata failure does not renew its
+cache timestamp; expired metadata cannot produce a fresh signed snapshot.
+Order-book timestamps, the 10 s book limit, coverage leases, minimum hedge size,
+confirmation requirements and safety cooldowns are unchanged. No CEX plugin
+configuration or adapter-specific changes are required. These independent
+public plugin processes increase memory use per subscribed market; measure that
+cost and actual withdrawal frequency after an approved restart.
+
+Automatic quantity already decreases immediately, bypassing normal update
+interval/hysteresis, when a valid smaller protected quote can be calculated.
+Fixed quantities do not silently shrink. Funds committed to every other order
+remain reserved. If the residual funds are below the venue minimum hedge value,
+no smaller valid order exists: keep WAITING until funds/limits change. Do not
+count an update in place as a withdrawal, or call net uncommitted funds the
+account's total balance. A hard safety breaker can still withdraw an uncovered
+order before a resize is confirmed; do not leave that order exposed on the
+assumption an RPC update will succeed.
+
+Offline regression tests cover blocked metadata with continued fresh depth,
+independent readers across symbols and venues, unchanged expiry on failed
+refresh, public clients without credentials/trading permission, and thread
+cleanup. Actual uptime improvement requires comparison of the existing order
+UUID/state-change history after deployment; test success alone is not proof of
+live Tor/CEX reliability.
+
+
+### Uncertain cancellation recovery (5 October 2026)
+
+Cancellation intent and provenance are persisted before the KDF write. A lost
+reply enters RECOVERING and is checked every ten seconds using bounded reads.
+For cancellation without swaps, recovery requires the exact owned UUID and
+pair, its absence from live makers, explicit Cancelled history with empty
+matches/started swaps, no active swaps, and clear reconciliation gates. A still
+visible owned UUID may only receive another cancellation after thirty seconds;
+publication and additive quantity updates are never replayed by this path.
+Automatic strategies resume through normal freshness, coverage and cooldown
+checks after proof. Manual pauses revoke that permission and remain paused.
+Swap, update and publication recovery retain their own independent gates.
+
+Coin activation reads use a shared background snapshot. Unavailable or malformed
+RPC data is distinct from an empty set of active coins. Unknown data prevents
+new writes; briefly held existing orders retain the independent exposure
+guards, and an expired snapshot follows the safe withdrawal path. The GUI
+receives recovery status and the next readback delay. KDF_RPC diagnostics expose
+only method, UTC timestamp, duration and transport outcome, never payloads.
+
+Local candidate verification: Linux AppImage and engine compiled; Flutter
+static analysis passed; Impeller disabled. After login, both legacy cancellation
+blocks recovered through KDF readback. Subsequent coverage withdrawals are
+separate events. New unit tests were not run for the cancellation change; CI
+results and a longer live observation window must be recorded separately.

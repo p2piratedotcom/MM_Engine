@@ -106,6 +106,16 @@ def create_client(venue: str, *, base_url=None, **kwargs) -> SpotExchange:
     return cls(base_url=base_url or config.base_url, **kwargs)
 
 
+def create_public_reader(venue: str, *, base_url=None) -> SpotExchange:
+    """Independent read-only lane; never reuse the credential/client pool."""
+    plugins = installed_plugins()
+    if plugins is not None:
+        from .plugin_client import SpotPluginClient
+        config = load_config(venue)
+        return SpotPluginClient(plugins[config.venue], trading_enabled=False)
+    return create_client(venue, base_url=base_url, trading_enabled=False)
+
+
 def private_client(venue: str, keyring, *, base_url=None, trading_enabled=False):
     # Credentials stay in the wallet keyring; the adapter owns signing.
     credentials = keyring.load(venue)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import secrets
 import sys
 import threading
 import time
@@ -25,7 +26,7 @@ from .models import DexSide
 from .outbox import HedgeEventOutbox, OutboxConflict
 from .ownership import OrderOwnershipStore
 from .public_feed import MexcPublicFeed, MexcPublicFeedGroup
-from .exchanges import create_client, supported_venues, load_config
+from .exchanges import create_client, create_public_reader, supported_venues, load_config
 from .exchanges.plugin_catalog import installed_plugins
 from .quote_engine import RepricingEngine
 from .reconciliation import KdfReconciler, KdfReconciliationError
@@ -72,6 +73,14 @@ WALLET_POST_PATHS = frozenset({
 })
 
 
+# Worker-only routes: the GUI bearer token cannot renew coverage or acknowledge
+# hedge events. The local worker receives a separate process-scoped token.
+WALLET_WORKER_GET_PATHS = frozenset({"/v1/events"})
+WALLET_WORKER_POST_PATHS = frozenset({
+    "/v1/events/acknowledge", "/v1/coverage/lease",
+    "/v1/coverage/publication-hold",
+})
+
 def _owned_payload(order: object) -> dict[str, str | None]:
     raw = asdict(order)
     return {
@@ -110,9 +119,14 @@ def handler_factory(
     wallet_mode: bool = False,
     cex_profile: str = "default",
     wallet_live_enabled: bool = False,
+    wallet_worker_token: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     if not token:
         raise ValueError("agent token is required")
+    if wallet_worker_token is not None and (not wallet_mode or
+            len(wallet_worker_token) < 32 or
+            hmac.compare_digest(wallet_worker_token, token)):
+        raise ValueError("wallet worker requires a separate private token")
 
     class AgentHandler(BaseHTTPRequestHandler):
         server_version = "KdfMmAgent/0.1"
@@ -123,7 +137,8 @@ def handler_factory(
 
         def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
             path = urlparse(self.path).path
-            if wallet_mode and path not in WALLET_GET_PATHS:
+            if wallet_mode and path not in (WALLET_GET_PATHS |
+                    (WALLET_WORKER_GET_PATHS if wallet_worker_token else frozenset())):
                 self._json(404, {"error": "not found"})
                 return
             if path == "/health":
@@ -338,7 +353,8 @@ def handler_factory(
                 self._json(404, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
-            if wallet_mode and urlparse(self.path).path not in WALLET_POST_PATHS:
+            if wallet_mode and urlparse(self.path).path not in (WALLET_POST_PATHS |
+                    (WALLET_WORKER_POST_PATHS if wallet_worker_token else frozenset())):
                 self._json(404, {"error": "not found"})
                 return
             if not self._authenticated():
@@ -681,7 +697,12 @@ def handler_factory(
         def _authenticated(self) -> bool:
             header = self.headers.get("Authorization", "")
             supplied = header[7:] if header.startswith("Bearer ") else ""
-            if hmac.compare_digest(supplied, token):
+            path = urlparse(self.path).path
+            worker_paths = (WALLET_WORKER_GET_PATHS if self.command == "GET"
+                            else WALLET_WORKER_POST_PATHS)
+            expected = (wallet_worker_token if wallet_mode and path in worker_paths
+                        else token)
+            if expected and hmac.compare_digest(supplied, expected):
                 return True
             self._json(401, {"error": "unauthorized"})
             return False
@@ -908,6 +929,8 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
     strategies = StrategyService(controller=controller, store=strategy_store,
         preview_balances=preview_balances,
         feed_group=public_feed,
+        public_client_factory=lambda venue: create_public_reader(
+            venue, base_url=getattr(settings, venue.lower()+"_base_url", None)),
         public_clients={
             venue: create_client(venue, base_url=getattr(settings,venue.lower()+"_base_url",None))
             for venue in supported_venues()
@@ -942,6 +965,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
     from .wallet_send import WalletSend
     wallet_send = WalletSend(controller, strategies, repricing, settings.desktop_journal_db,
                              enabled=settings.live_transfers)
+    worker_token = secrets.token_urlsafe(48) if wallet_mode and with_mexc else None
     server = ThreadingHTTPServer(
         (settings.agent_bind, settings.agent_port),
         handler_factory(
@@ -958,6 +982,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
             strategies=strategies,
             wallet_send=wallet_send,
             wallet_mode=wallet_mode,
+            wallet_worker_token=worker_token,
             cex_profile=mexc_profile,
             wallet_live_enabled=(settings.kdf_order_writes and settings.auto_hedge
                                  and settings.live_trading),
@@ -966,6 +991,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
     # Port zero allows the wallet to allocate an unused loopback port. The
     # local worker must use the actual bound port for its own authenticated API.
     settings = replace(settings, agent_port=server.server_address[1])
+    controller.start_coin_state_worker()
     stop_monitor = threading.Event()
 
     def monitor_market_freshness() -> None:
@@ -1015,7 +1041,9 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
     shutdown_report: dict[str, object] = {"orders_remaining": 0, "cancel_error": None}
     try:
         if with_mexc:
-            local_mexc = LocalMexcWorker(settings, profile=mexc_profile)
+            local_mexc = LocalMexcWorker(
+                replace(settings, agent_token=worker_token) if worker_token else settings,
+                profile=mexc_profile)
             local_mexc.start()
         if public_feed is not None:
             if isinstance(public_feed, MexcPublicFeedGroup):
@@ -1043,6 +1071,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
         print("KDF VPS Agent stopped")
     finally:
         stop_monitor.set()
+        controller.stop_coin_state_worker()
         monitor.join(timeout=2.0)
         strategies.close()
         repricing.stop_worker()
