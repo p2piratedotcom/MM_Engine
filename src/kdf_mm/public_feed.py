@@ -41,6 +41,7 @@ class MexcPublicFeed:
         clock_ms: Any | None = None,
         sample_sink: Any | None = None,
         venue: str = "MEXC",
+        client_factory: Any | None = None,
     ) -> None:
         if not snapshot_secret:
             raise ValueError("snapshot_secret is required")
@@ -48,7 +49,13 @@ class MexcPublicFeed:
             raise ValueError("MEXC feed interval must be at least one second")
         if depth_limit <= 0 or depth_limit > 5000:
             raise ValueError("MEXC depth limit must be in [1, 5000]")
-        self.client = client
+        # Each symbol has an independent book reader. Plugin hosts serialize
+        # requests, so shared readers can starve one market behind another.
+        # Metadata uses a second public-only reader and never queues ahead of
+        # depth. The factory must not contain credentials or trading permission.
+        self.client = client_factory() if client_factory else client
+        self._metadata_client = client_factory() if client_factory else client
+        self._owns_clients = client_factory is not None
         self.store = store
         self.snapshot_secret = snapshot_secret
         self.symbol = symbol.upper()
@@ -66,6 +73,9 @@ class MexcPublicFeed:
         self._ticker: Mapping[str, Any] | None = None
         self._ticker_at_ms: int | None = None
         self._thread: threading.Thread | None = None
+        self._metadata_thread: threading.Thread | None = None
+        self._fetch_lock = threading.RLock()
+        self._metadata_lock = threading.RLock()
         self._stop = threading.Event()
         self._lock = threading.RLock()
         self._timings_ms: dict[str, float] = {}
@@ -79,6 +89,11 @@ class MexcPublicFeed:
                 self._timings_ms[name] = round((time.monotonic() - started) * 1000, 2)
 
     def fetch_once(self) -> Mapping[str, Any]:
+        # Manual previews may refresh while the polling thread is active.
+        with self._fetch_lock:
+            return self._fetch_once()
+
+    def _fetch_once(self) -> Mapping[str, Any]:
         with self._lock:
             self._timings_ms = {}
         # Static symbol rules and rolling volume can arrive slowly over Tor.
@@ -165,6 +180,13 @@ class MexcPublicFeed:
             if self._thread is not None and self._thread.is_alive():
                 return
             self._stop.clear()
+            if self._owns_clients:
+                self._metadata_thread = threading.Thread(
+                    target=self._run_metadata,
+                    name=f"{self.venue.lower()}-public-metadata",
+                    daemon=True,
+                )
+                self._metadata_thread.start()
             self._thread = threading.Thread(
                 target=self._run,
                 name=f"{self.venue.lower()}-public-feed",
@@ -176,8 +198,15 @@ class MexcPublicFeed:
         self._stop.set()
         with self._lock:
             thread = self._thread
-        if thread is not None:
-            thread.join(timeout=max(2.0, self.interval_seconds + 1.0))
+            metadata_thread = self._metadata_thread
+        for worker in (thread, metadata_thread):
+            if worker is not None:
+                worker.join(timeout=17.0)
+        if self._owns_clients:
+            for client in (self.client, self._metadata_client):
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
 
     def status(self) -> MexcPublicFeedStatus:
         with self._lock:
@@ -206,10 +235,14 @@ class MexcPublicFeed:
             cached = self._symbol
         if cached is not None:
             return cached
-        rules = self._read(self.client.symbol_rules, self.symbol, deadline=deadline)
-        with self._lock:
-            self._symbol = rules
-        return rules
+        with self._metadata_lock:
+            with self._lock:
+                if self._symbol is not None:
+                    return self._symbol
+            rules = self._read(self._metadata_client.symbol_rules, self.symbol, deadline=deadline)
+            with self._lock:
+                self._symbol = rules
+            return rules
 
     def _ticker_24h(self, deadline: float) -> Mapping[str, Any]:
         # The rolling 24h volume changes much more slowly than the order book.
@@ -220,11 +253,41 @@ class MexcPublicFeed:
             if (self._ticker is not None and self._ticker_at_ms is not None
                     and 0 <= now - self._ticker_at_ms < 15_000):
                 return self._ticker
-        ticker = self._read(self.client.ticker_24h, self.symbol, deadline=deadline)
         with self._lock:
-            self._ticker = ticker
-            self._ticker_at_ms = self.clock_ms()
-        return ticker
+            running = self._metadata_thread is not None and self._metadata_thread.is_alive()
+        if running:
+            # Do not block depth behind a slow metadata refresh or renew the
+            # book timestamp using volume that has exceeded its original TTL.
+            raise MexcPublicFeedError(f"{self.venue} rolling-volume data is unavailable or expired")
+        return self._refresh_ticker(deadline)
+
+    def _refresh_ticker(self, deadline):
+        with self._metadata_lock:
+            ticker = self._read(self._metadata_client.ticker_24h, self.symbol, deadline=deadline)
+            try:
+                volume = Decimal(str(ticker["volume"]))
+                if not volume.is_finite() or volume < 0:
+                    raise ValueError("invalid volume")
+            except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
+                raise MexcPublicFeedError(f"{self.venue} reported invalid 24h volume") from exc
+            with self._lock:
+                self._ticker = ticker
+                self._ticker_at_ms = self.clock_ms()
+            return ticker
+
+    def _run_metadata(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._symbol_rules(time.monotonic() + 12.0)
+                # Refresh ahead of the unchanged 15-second volume TTL, with
+                # a bounded request on a reader independent from order books.
+                self._refresh_ticker(time.monotonic() + 4.0)
+            except Exception:
+                # A failed refresh does not extend the cached data's lifetime.
+                # fetch_once/status and the existing circuit breaker expose
+                # expired data and withdraw unprotected orders normally.
+                pass
+            self._stop.wait(5.0)
 
     def _run(self) -> None:
         while not self._stop.is_set():

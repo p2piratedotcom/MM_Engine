@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Mapping
 
-from .kdf import KdfRpcClient
+from .kdf import KdfRpcClient, KdfError
 from .models import DexSide
 from .ownership import (
     OrderOwnershipStore,
@@ -20,6 +21,11 @@ from .ownership import (
 
 class KdfReconciliationError(RuntimeError):
     pass
+
+
+class KdfSwapInitializationPending(KdfReconciliationError):
+    """An unknown active UUID is waiting for its first durable KDF status."""
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +80,7 @@ class KdfReconciler:
         self.pool_resolver = pool_resolver
         self.active_swap_callback = active_swap_callback
         self.owned_swap_observer = owned_swap_observer
+        self._initializing: dict[str, int] = {}
         self._ready = False
         self._last_success_ms: int | None = None
         self._consecutive_failures = 0
@@ -128,6 +135,21 @@ class KdfReconciler:
                 )
                 self._reconcile_swaps(swap_statuses)
                 self._reconcile_orders(maker_orders)
+                if self._initializing:
+                    raise KdfSwapInitializationPending(
+                        "KDF swap initialization pending: " + ", ".join(sorted(self._initializing))
+                    )
+            except KdfSwapInitializationPending as exc:
+                # No new publication/update until ownership is known. Existing
+                # orders retain independent balance, market and hedge guards.
+                with self._lock:
+                    self._ready = False
+                    self._last_error = str(exc)
+                    self._kdf_maker_orders = len(maker_orders)
+                    self._unowned_order_uuids = tuple(sorted(
+                        uuid for uuid in maker_orders if self.ownership.get(uuid) is None
+                    ))
+                raise
             except Exception as exc:
                 self._record_failure(exc)
                 raise KdfReconciliationError(str(exc)) from exc
@@ -151,6 +173,29 @@ class KdfReconciler:
             if self._last_error:
                 return f"KDF reconciliation is not ready: {self._last_error}"
             return "KDF reconciliation has not completed yet"
+
+    def initialization_pending_for_quote(self, market_id: str, dex_side: DexSide) -> bool:
+        """Permit a bounded read-only hold, never publication or hedge bypass."""
+        with self._lock:
+            pending = bool(self._initializing) and bool(
+                self._last_error and self._last_error.startswith("KDF swap initialization pending:")
+            ) and not self._unowned_order_uuids and self._consecutive_failures == 0 \
+                and self._last_success_ms is not None
+        pool = self._pool_for(market_id, dex_side)
+        return (pending and not self.ownership.problem_orders_for_pool(pool)
+                and self.ownership.blocking_swap_for_pool(pool) is None)
+
+    @staticmethod
+    def _missing_initial_status(exc: KdfError, uuid: str) -> bool:
+        # Match the KDF contract, not an arbitrary HTTP 500 or message fragment.
+        payload = exc.payload
+        error = payload.get("error") if isinstance(payload, Mapping) else None
+        return isinstance(error, str) and re.fullmatch(
+            r"(?:[A-Za-z_][A-Za-z0-9_./:-]*:\d+\]\s*)*(?:RPC call failed:\s*)?"
+            r"(?:[A-Za-z_][A-Za-z0-9_./:-]*:\d+\]\s*)*"
+            r"(?:swap data is not found|No swap with uuid " + re.escape(uuid) + r")",
+            error,
+        ) is not None
 
     def block_reason(self, dex_side: DexSide) -> str | None:
         readiness = self.resume_block_reason()
@@ -240,9 +285,11 @@ class KdfReconciler:
                 terminal_swaps_to_acknowledge=terminal_to_acknowledge,
                 problem_orders=len(problems),
             )
+            initializing = sorted(self._initializing)
         return {
             **asdict(status),
             "unowned_order_uuids": list(self._unowned_order_uuids),
+            "initializing_swap_uuids": initializing,
             "swaps": [self._swap_payload(swap) for swap in swaps],
             "problem_order_uuids": [order.order_uuid for order in problems],
         }
@@ -257,6 +304,12 @@ class KdfReconciler:
         if not all(isinstance(uuid, str) and isinstance(value, Mapping) for uuid, value in orders.items()):
             raise KdfReconciliationError("KDF maker_orders has an invalid shape")
         return orders
+
+    def _canonical_swap_status(self, uuid: str) -> Any:
+        try:
+            return self.kdf.swap_status(uuid)
+        except KdfError as exc:
+            raise KdfError(f"KDF swap {uuid}: {exc}", payload=exc.payload) from exc
 
     def _swap_statuses(
         self,
@@ -279,6 +332,16 @@ class KdfReconciler:
         ):
             raise KdfReconciliationError("KDF my_recent_swaps omitted swaps")
 
+        with self._lock:
+            self._initializing = {uuid: first for uuid, first in self._initializing.items()
+                                  if uuid in active_uuids}
+        owned_started = set()
+        for order_uuid, order in maker_orders.items():
+            if self.ownership.get(order_uuid) is not None:
+                started = order.get("started_swaps", [])
+                if not isinstance(started, list) or not all(isinstance(u, str) for u in started):
+                    raise KdfReconciliationError("owned order has invalid started_swaps")
+                owned_started.update(started)
         combined: dict[str, tuple[Mapping[str, Any], bool]] = {}
         for item in recent_payload["swaps"]:
             status = self._normalize_swap(item)
@@ -301,7 +364,7 @@ class KdfReconciler:
                         )
                     )
                 ):
-                    item = self.kdf.swap_status(uuid)
+                    item = self._canonical_swap_status(uuid)
                     canonical = self._normalize_swap(item)
                     if canonical is None or canonical.get("uuid") != uuid:
                         raise KdfReconciliationError(
@@ -321,11 +384,29 @@ class KdfReconciler:
         for uuid in active_uuids:
             item = statuses.get(uuid)
             if not isinstance(item, Mapping):
-                item = self.kdf.swap_status(uuid)
+                recent = self._normalize_swap(combined.get(uuid, ({}, False))[0])
+                if recent is not None and str(recent.get("type", "")).startswith("Taker"):
+                    # UUID is active and its role is already durable: wallet
+                    # takers are not engine maker swaps and need no canonical lookup.
+                    item = combined[uuid][0]
             if not isinstance(item, Mapping):
-                raise KdfReconciliationError(
-                    f"KDF omitted status for active swap {uuid}"
-                )
+                try:
+                    item = self._canonical_swap_status(uuid)
+                except KdfError as exc:
+                    known_owned = uuid in owned_started or self.ownership.get_swap(uuid) is not None
+                    if known_owned or not self._missing_initial_status(exc, uuid):
+                        raise
+                    with self._lock:
+                        first = self._initializing.setdefault(uuid, self.clock_ms())
+                    if self.clock_ms() - first >= 30_000:
+                        raise KdfReconciliationError(
+                            f"KDF missing swap status persisted beyond 30 seconds: {uuid}"
+                        ) from exc
+                    continue
+            if not isinstance(item, Mapping):
+                raise KdfReconciliationError(f"KDF omitted status for active swap {uuid}")
+            with self._lock:
+                self._initializing.pop(uuid, None)
             combined[uuid] = (item, True)
         for order_uuid, order in maker_orders.items():
             if self.ownership.get(order_uuid) is None:
@@ -340,7 +421,7 @@ class KdfReconciler:
             for uuid in started:
                 item = combined.get(uuid, (None, False))[0]
                 if item is None:
-                    item = self.kdf.swap_status(uuid)
+                    item = self._canonical_swap_status(uuid)
                 status = self._normalize_swap(item)
                 if status is None:
                     raise KdfReconciliationError(

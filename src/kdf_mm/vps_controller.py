@@ -7,6 +7,7 @@ from dataclasses import asdict
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
+from .cancellation_recovery import CancellationRecovery, AUTOMATIC_SOURCES
 from .coin_registry import CoinRegistry
 from .activation_failover import EvmActivationFailover
 from .coverage import CoverageError, CoverageGuard
@@ -38,6 +39,12 @@ LOG = logging.getLogger(__name__)
 
 class HedgeDepthError(ValueError):
     """Order-specific liquidity failure, not a global balance failure."""
+
+
+class KdfCoinStateUnavailable(RuntimeError):
+    def __init__(self, age):
+        self.snapshot_age = age
+        super().__init__('KDF coin activation state unavailable; waiting for a verified snapshot')
 
 
 class ActiveOrderLimitError(RuntimeError):
@@ -122,6 +129,13 @@ class VpsController:
         self.strategy_siblings = None
         self.rebalance_lock_path = None
         self.publications = PublicationRecovery(ownership)
+        self.cancellations = CancellationRecovery(ownership)
+        self._coin_lock = threading.RLock()
+        self._coin_snapshot = None
+        self._coin_observed = 0.0
+        self._coin_error = None
+        self._coin_stop = threading.Event()
+        self._coin_thread = None
 
     def market_spec(self, market_id: str | None = None) -> MarketSpec:
         selected = market_id or self.default_market_id
@@ -372,7 +386,15 @@ class VpsController:
 
     def market_activity(self) -> dict[str, Any]:
         """Resolve price subscriptions from enabled coins and live bot state."""
-        enabled = self._enabled_tickers()
+        try:
+            enabled = self._enabled_tickers()
+            coin_state_available = True
+        except KdfCoinStateUnavailable:
+            # Preserve public subscriptions, not permission to publish. Trade
+            # paths reject unknown activation state; exposure guards still run.
+            with self._coin_lock:
+                enabled = self._coin_snapshot or set()
+            coin_state_available = False
         open_market_ids = {order.market_id for order in self.ownership.active()}
         swap_market_ids = {
             swap.market_id
@@ -391,7 +413,8 @@ class VpsController:
             active = coins_enabled or kept_for_live_trade
             result[market_id] = {
                 "active": active,
-                "coins_enabled": coins_enabled,
+                "coins_enabled": coins_enabled if coin_state_available else None,
+                "coin_state_available": coin_state_available,
                 "kept_for_live_trade": kept_for_live_trade,
                 "quote_ticker": spec.quote_ticker,
                 "base_ticker": spec.base_ticker,
@@ -982,16 +1005,23 @@ class VpsController:
             if not reason or not source:
                 raise ValueError('Motivo e origine della cancellazione obbligatori')
             strategy_id = strategy_id or getattr(self, 'order_strategy_id', lambda uuid: '')(order_uuid) or ''
-            self.ownership.record_order_event(order_uuid, 'CANCEL_REQUESTED', source=source,
+            resume = (source in AUTOMATIC_SOURCES and bool(strategy_id)
+                      and bool(getattr(self, 'cancellation_resume_requested', lambda _sid: False)(strategy_id)))
+            self.cancellations.begin(order_uuid, strategy_id, source, reason, resume_requested=resume)
+            if source == 'strategy_update_recovery':
+                self.cancellations.state(order_uuid, 'DELEGATED')
+            self.ownership.record_order_event(order_uuid, 'CANCEL_REQUESTED' , source=source,
                                              reason=reason, strategy_id=strategy_id)
             try:
                 self.kdf.cancel_order(order_uuid)
             except Exception as exc:
+                self.cancellations.failed(order_uuid, str(exc))
                 self.ownership.record_order_event(order_uuid, 'CANCEL_FAILED_OR_UNCERTAIN', source=source,
                     reason=reason, strategy_id=strategy_id, detail=str(exc))
                 raise
             cancelled = self.ownership.mark(order_uuid, OwnedOrderStatus.CANCELLED, error=reason,
                                             source=source, strategy_id=strategy_id)
+            self.cancellations.confirmed(order_uuid)
             callback = getattr(self, "note_strategy_withdrawal", None)
             if callback is not None and strategy_id:
                 try:
@@ -1075,25 +1105,52 @@ class VpsController:
                         self.cancel_owned_order(order.order_uuid, reason=f"market-data circuit breaker: {exc}", source='market_data')
         return all_fresh
 
-    def _enabled_tickers(self) -> set[str] | None:
-        enabled_coins = getattr(self.kdf, "enabled_coins", None)
-        if enabled_coins is None:
-            # Lightweight test adapters and external snapshot mode predate the
-            # activation-aware feed. Treat their configured markets as active.
-            return None
+    def refresh_coin_state(self):
+        reader = getattr(self.kdf, 'enabled_coins', None)
+        if reader is None:
+            return
         try:
-            payload = enabled_coins()
-        except Exception:
-            return set()
-        if not isinstance(payload, Mapping) or not isinstance(
-            payload.get("coins"), list
-        ):
-            return set()
-        return {
-            str(item["ticker"])
-            for item in payload["coins"]
-            if isinstance(item, Mapping) and item.get("ticker")
-        }
+            payload = (reader(timeout=3.0) if isinstance(self.kdf, KdfRpcClient) else reader())
+            if (not isinstance(payload, Mapping) or not isinstance(payload.get('coins'), list)
+                    or any(not isinstance(item, Mapping) or not isinstance(item.get('ticker'), str)
+                           or not item['ticker'] for item in payload['coins'])):
+                raise ValueError('invalid enabled coin response')
+            snapshot = frozenset(item['ticker'] for item in payload['coins'])
+            with self._coin_lock:
+                self._coin_snapshot = snapshot
+                self._coin_observed = time.monotonic()
+                self._coin_error = None
+        except Exception as exc:
+            with self._coin_lock:
+                self._coin_error = type(exc).__name__
+            LOG.warning('KDF_COIN_SNAPSHOT unavailable error_class=%s', type(exc).__name__)
+
+    def start_coin_state_worker(self):
+        if self._coin_thread and self._coin_thread.is_alive():
+            return
+        self.refresh_coin_state()  # Initial read before any trading/order lock.
+        self._coin_stop.clear()
+        def refresh():
+            while not self._coin_stop.wait(2.0):
+                self.refresh_coin_state()
+        self._coin_thread = threading.Thread(target=refresh, name='kdf-coin-snapshot', daemon=True)
+        self._coin_thread.start()
+
+    def stop_coin_state_worker(self):
+        self._coin_stop.set()
+        if self._coin_thread:
+            self._coin_thread.join(timeout=4.0)
+
+    def _enabled_tickers(self) -> set[str] | None:
+        if getattr(self.kdf, 'enabled_coins', None) is None:
+            return None  # Offline adapters predate activation-aware feeds.
+        if self._coin_thread is None:
+            self.refresh_coin_state()  # Synchronous external/test adapter mode.
+        with self._coin_lock:
+            age = time.monotonic() - self._coin_observed if self._coin_snapshot is not None else float('inf')
+            if self._coin_error or age > 8.0:
+                raise KdfCoinStateUnavailable(age)
+            return set(self._coin_snapshot)
 
     def _assert_market_fresh(self, market_id: str) -> None:
         for symbol in self.market_spec(market_id).required_symbols:

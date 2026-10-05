@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Mapping
 
@@ -87,8 +90,9 @@ class KdfRpcClient:
     def cancel_enable_evm_with_tokens(self, task_id: int) -> Any:
         return self.v2("task::enable_eth::cancel", {"task_id": task_id})
 
-    def enabled_coins(self) -> Any:
-        return self.v2("get_enabled_coins", {})
+    def enabled_coins(self, *, timeout: float | None = None) -> Any:
+        return self._post({'mmrpc': '2.0', 'id': 0, 'userpass': self.userpass,
+                           'method': 'get_enabled_coins', 'params': {}}, timeout=timeout)
 
     def disable_coin(self, ticker: str) -> Any:
         selected = ticker.strip().upper()
@@ -246,13 +250,14 @@ class KdfRpcClient:
     def my_orders(self) -> Any:
         return self.legacy("my_orders")
 
-    def order_status(self, order_uuid: str) -> Any:
+    def order_status(self, order_uuid: str, *, timeout: float | None = None) -> Any:
         if not order_uuid:
             raise ValueError("order UUID is required")
-        return self.legacy("order_status", uuid=order_uuid)
+        return self._post({'userpass': self.userpass, 'method': 'order_status', 'uuid': order_uuid}, timeout=timeout)
 
-    def active_swaps(self, *, include_status: bool = True) -> Any:
-        return self.v2("active_swaps", {"include_status": include_status})
+    def active_swaps(self, *, include_status: bool = True, timeout: float | None = None) -> Any:
+        return self._post({'userpass': self.userpass, 'mmrpc': '2.0', 'id': 0,
+                           'method': 'active_swaps', 'params': {'include_status': include_status}}, timeout=timeout)
 
     def recent_swaps(self, *, limit: int = 100) -> Any:
         return self.v2(
@@ -283,6 +288,8 @@ class KdfRpcClient:
         timeout: float | None = None,
     ) -> Any:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        started = time.monotonic()
+        outcome = 'received'
         try:
             response = self.transport.request(
                 method="POST",
@@ -292,7 +299,16 @@ class KdfRpcClient:
                 timeout=self.timeout if timeout is None else min(self.timeout, timeout),
             )
         except TransportError as exc:
+            outcome = 'transport_error'
             raise KdfError(f"KDF RPC {payload.get('method', '?')}: {exc}", payload=exc.payload) from exc
+
+        finally:
+            elapsed_ms = round((time.monotonic() - started) * 1000)
+            if outcome != 'received' or elapsed_ms >= 1000:
+                logging.getLogger(__name__).warning(
+                    'KDF_RPC observed_at_utc=%s method=%s elapsed_ms=%s outcome=%s',
+                    datetime.now(timezone.utc).isoformat(),
+                    payload.get('method', '?'), elapsed_ms, outcome)
 
         if not isinstance(response, Mapping):
             raise KdfError("KDF returned a non-object response", payload=response)
