@@ -47,6 +47,8 @@ class TransportError(Exception):
     message: str
     status: int | None = None
     payload: Any = None
+    kind: str | None = None
+    phase: str | None = None
 
     def __str__(self) -> str:
         suffix = f" (HTTP {self.status})" if self.status is not None else ""
@@ -85,21 +87,24 @@ class UrllibJsonTransport:
                 total_timeout=min(timeout, total_timeout),
             ))
         request = Request(url, data=body, headers=dict(headers or {}), method=method)
+        phase = 'connect_or_headers'
         try:
             with _open(request, timeout=timeout) as response:
+                phase = 'response_body'
                 raw = response.read()
         except HTTPError as exc:
             raw = exc.read()
             raise TransportError(
                 "remote API rejected the request",
                 status=exc.code,
-                payload=_decode_payload(raw),
+                payload=_decode_payload(raw), kind="http_rejected", phase="response_headers",
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
             # Do not include exception text: it may contain a signed URL/token.
             cause = getattr(exc, 'reason', exc)
             kind = 'timeout' if isinstance(cause, TimeoutError) else type(cause).__name__
-            raise TransportError(f"remote API is unreachable ({kind})") from exc
+            raise TransportError(f"remote API is unreachable ({kind})",
+                                 kind=kind, phase=phase) from exc
         return _decode_payload(raw)
 
     async def _request_with_deadline(
@@ -110,6 +115,7 @@ class UrllibJsonTransport:
         # aiohttp's total deadline includes both, even when the server stalls.
         import aiohttp
 
+        phase = 'connect_or_headers'
         try:
             deadline = aiohttp.ClientTimeout(total=total_timeout)
             async with aiohttp.ClientSession(timeout=deadline) as session:
@@ -119,19 +125,20 @@ class UrllibJsonTransport:
                     proxy=(None if _is_loopback(url) else _wallet_proxy_url)
                     if _wallet_proxy_configured else None,
                 ) as response:
+                    phase = "response_body"
                     raw = await response.read()
                     if response.status >= 400 or 300 <= response.status < 400:
                         raise TransportError(
                             "remote API rejected the request",
                             status=response.status,
-                            payload=_decode_payload(raw),
+                            payload=_decode_payload(raw), kind="http_rejected", phase="response_headers",
                         )
                     return _decode_payload(raw)
         except asyncio.TimeoutError as exc:
-            raise TransportError("remote API is unreachable (timeout)") from exc
+            raise TransportError("remote API is unreachable (timeout)", kind="timeout", phase=phase) from exc
         except aiohttp.ClientError as exc:
             raise TransportError(
-                f"remote API is unreachable ({type(exc).__name__})"
+                f"remote API is unreachable ({type(exc).__name__})", kind=type(exc).__name__, phase=phase
             ) from exc
 
 

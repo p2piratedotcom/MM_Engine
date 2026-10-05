@@ -12,6 +12,8 @@ from decimal import Decimal
 from typing import Any, Mapping
 
 from .http import JsonTransport, TransportError, UrllibJsonTransport
+from .network_diagnostics import emit as diagnostic
+from uuid import uuid4
 
 
 class KdfError(RuntimeError):
@@ -360,31 +362,62 @@ class KdfRpcClient:
     ) -> Any:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         started = time.monotonic()
+        started_at_ms = time.time_ns() // 1_000_000
+        request_id = uuid4().hex
+        method = payload.get('method')
+        method = method if method in {
+            'max_maker_vol', 'my_orders', 'get_enabled_coins', 'setprice',
+            'update_maker_order', 'cancel_order', 'order_status', 'active_swaps',
+            'my_recent_swaps', 'my_swap_status', 'my_balance', 'trade_preimage',
+            'buy', 'sell', 'withdraw', 'send_raw_transaction', 'disable_coin',
+        } else 'other'
+        effective_timeout = self.timeout if timeout is None else min(self.timeout, timeout)
         outcome = 'received'
+        response = None
+        failure_kind = phase = None
+        http_status = None
         mutation = payload.get('method') in {
             'setprice', 'update_maker_order', 'cancel_order', 'buy', 'sell',
             'withdraw', 'send_raw_transaction', 'disable_coin',
         }
         if mutation:
             self._invalidate_capacity(1)
+        diagnostic('kdf_request_start', request_id=request_id, method=method,
+                   started_at_ms=started_at_ms, timeout_ms=round(effective_timeout*1000),
+                   mutating=mutation, route='local_kdf')
         try:
             response = self.transport.request(
                 method="POST",
                 url=self.rpc_url,
                 headers={"Content-Type": "application/json"},
                 body=body,
-                timeout=self.timeout if timeout is None else min(self.timeout, timeout),
+                timeout=effective_timeout,
             )
         except TransportError as exc:
             outcome = 'transport_error'
+            failure_kind, phase, http_status = exc.kind, exc.phase, exc.status
             raise KdfError(f"KDF RPC {payload.get('method', '?')}: {exc}", payload=exc.payload) from exc
 
+        except Exception:
+            outcome = 'client_error'
+            raise
         finally:
             if mutation:
                 self._invalidate_capacity(-1)
             elapsed_ms = round((time.monotonic() - started) * 1000)
             if outcome != 'received' or elapsed_ms >= 1000:
                 self._diagnostic(payload.get('method'), elapsed_ms, outcome)
+            response_outcome = outcome
+            if outcome == 'received':
+                response_outcome = ('invalid_response' if not isinstance(response, Mapping) else
+                                    'rpc_error' if response.get('error') is not None else 'received')
+            diagnostic('kdf_request_end', request_id=request_id, method=method,
+                       started_at_ms=started_at_ms, elapsed_ms=elapsed_ms,
+                       wall_elapsed_ms=time.time_ns()//1_000_000-started_at_ms,
+                       timeout_ms=round(effective_timeout*1000), outcome=response_outcome,
+                       failure_kind=failure_kind, phase=phase, http_status=http_status,
+                       mutating=mutation, execution_unknown=mutation and response_outcome not in {'received', 'rpc_error'},
+                       route='local_kdf')
 
         if not isinstance(response, Mapping):
             raise KdfError("KDF returned a non-object response", payload=response)

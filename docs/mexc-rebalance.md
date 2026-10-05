@@ -17,11 +17,30 @@ seleziona il profilo (default se omesso). Non inserire le chiavi nei file di con
 
 ## Obiettivo confermato: copertura ordini + 20%
 
-Si considerano le strategie configurate, comprese quelle in pausa, escluse quelle eliminate
-o con budget esaurito. Le quantità fisse rispettano il budget residuo; quelle automatiche
-sono stimate con le regole di liquidità del motore (metà profondità entro l'1%, limiti
-utente e volume giornaliero). Il target è per il prossimo insieme di ordini, non per
-un numero illimitato di rifornimenti futuri.
+Si considerano le strategie selezionate, comprese quelle in pausa. Se una strategia
+ha ordini pubblicati, il target usa le quantità residue effettivamente pubblicate
+e il loro prezzo, anche se il budget è successivamente esaurito. Non somma una
+stima del prossimo ordine alla copertura dello stesso maker già aperto.
+
+Senza ordini pubblicati, le quantità fisse rispettano il budget residuo. Quelle
+automatiche sono limitate dal volume **realmente spendibile su KDF**, dal budget
+residuo/giornaliero e dalle regole di liquidità del motore (metà profondità entro
+l'1%, limiti utente e volume giornaliero). Si sottraggono i livelli già conteggiati
+della stessa coppia. I saldi CEX vengono esclusi dai limiti di questo solo calcolo
+del target, perché il suo scopo è determinarne la copertura necessaria; i fondi
+KDF non vengono mai ipotizzati illimitati. Un saldo KDF illeggibile impedisce una
+proposta eseguibile, anziché essere interpretato come zero o infinito.
+
+`Replenish` continua a seguire la politica live: senza un massimo per ordine non
+applica un budget totale non rifornibile, ma resta limitato ai fondi spendibili
+del wallet e agli altri tetti. Il target è per il prossimo insieme di ordini,
+non per un numero illimitato di rifornimenti futuri. Le strategie eliminate o
+con budget esaurito e senza ordini pubblicati non generano un nuovo target.
+
+Analyze mostra per ciascun maker quantità, origine del dimensionamento e
+contributo alla riserva CEX, già comprensivo di commissioni e margine del 20%.
+Il saldo spendibile e il budget giornaliero fanno parte della verifica del piano:
+se cambiano prima dell'esecuzione, occorre una nuova analisi e conferma.
 
 Il prezzo e le due gambe hedge delle coppie cross derivano dai book asset/USDT.
 Su MEXC le necessità di tutte le gambe si sommano e ricevono un margine del 20%,
@@ -35,11 +54,36 @@ copertura. Gli acquisti non anticipano mai i ricavi di vendite ancora da eseguir
 Se mancano fondi o le quantità sono sotto il minimo MEXC, viene mostrato un avviso.
 USDT è l'unità di valorizzazione: non viene garantita la parità con USD.
 
+### Freschezza dell’analisi
+
+Le regole dei simboli e le commissioni vengono verificate prima delle letture
+di mercato. L’analisi legge quindi i volumi a 24 ore e, per ultimi, i book,
+con al massimo quattro lettori pubblici indipendenti. Questi lettori non
+contengono chiavi API, non possono negoziare e vengono chiusi a fine analisi.
+Le letture hanno timeout espliciti e non competono con la corsia di hedging.
+
+I timestamp originali non vengono aggiornati artificialmente: un book deve
+avere al massimo 10 secondi e il volume al massimo 15 secondi. La lettura
+complessiva conserva il limite di 30 secondi e la freschezza viene ricontrollata
+prima di restituire il piano. I log diagnostici registrano metodo, simbolo,
+durata e anzianità dei dati per distinguere un timeout di rete da dati scaduti
+durante l’elaborazione. Non registrano saldi, credenziali o risposte API.
+
 ## Eseguire un rebalance MEXC
+
+Il worker cooperativo può restare avviato con i maker in pausa. Execute richiede
+il blocco esclusivo e attende al massimo 20 secondi che il ciclo CEX già avviato
+si concluda. Una porta di ammissione separata impedisce ai nuovi cicli di
+sorpassare la richiesta; le chiamate locali e gli ACK del ciclo corrente possono
+terminare normalmente. Durante l'esecuzione nessun nuovo ciclo operativo può
+entrare. Timeout ed errori rilasciano entrambi i lock, senza cancellare file né
+aggirare intenti pendenti. Un timeout di acquisizione avviene prima dell'intento
+durabile e non invia ordini; la proposta consumata richiede una nuova analisi.
+Un worker legacy non cooperativo continua a richiedere l'arresto controllato.
 
 1. Mettere manualmente in pausa tutte le strategie e il repricing. Attendere la
    conclusione di swap e hedge e la loro riconciliazione. Non devono restare ordini KDF.
-2. Fermare il worker MEXC di hedging. Il servizio Agent/KDF deve restare disponibile
+2. Se il worker non è cooperativo, fermare il worker MEXC di hedging. Il servizio Agent/KDF deve restare disponibile
    per le verifiche: se il worker era integrato con `--with-mexc`, occorre usare una
    sessione del servizio senza tale opzione, dopo l'arresto controllato precedente.
 3. TUI e Agent devono usare lo **stesso journal Desktop** e il medesimo account/profilo

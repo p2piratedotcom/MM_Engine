@@ -46,13 +46,13 @@ class WalletRebalance:
         finally:
             self._lock.release()
 
-    def _context(self):
-        # Consistent strategy/ownership view. No on-chain balances are needed
-        # for a Spot-only rebalance; never expose wallet-transfer suggestions.
+    def _context(self, *, include_wallet=True):
+        # Auto targets need spendable KDF balances even for Spot-only analysis.
+        # Scope and execution blockers do not need the additional balance reads.
         with self.strategies.lock, self.controller._order_lock:
             result = agent_context(self.controller, self.strategies,
-                self.reconciliation, self.repricing, include_wallet=False)
-            result['include_transfers'] = False
+                self.reconciliation, self.repricing, include_wallet=include_wallet,
+                include_transfers=False)
             result['open_quotes'] = []
             by_id = {r['id']: r for r in result['strategies']}
             for order in self.controller.ownership.active():
@@ -95,7 +95,7 @@ class WalletRebalance:
     def analyze(self, payload):
         with self._operation():
             venue = normalize_cex(payload.get('venue'))
-            context = self._context()
+            context = self._context(include_wallet=False)
             candidates = {r['id']: r for r in context['strategies']
                 if r['spec']['cex'] == venue and r['state'] != 'DELETED'}
             supplied = payload.get('strategy_ids')
@@ -123,7 +123,7 @@ class WalletRebalance:
                     'sell': spec.sold.ticker, 'buy': spec.bought.ticker})
             plan['reserve_percent'] = 20
             plan['scope'] = 'open_and_enabled' if supplied is None and any(candidates[s]['enabled'] for s in ids) else 'selected_configurations'
-            plan['execution_blockers'] = self._blockers(self._context())
+            plan['execution_blockers'] = self._blockers(self._context(include_wallet=False))
             plan['pause_required'] = any(r['enabled'] for r in self.strategies.status()['strategies'])
             plan['can_execute'] = bool(plan['orders']) and not plan['execution_blockers']
             plan.pop('transfers', None)

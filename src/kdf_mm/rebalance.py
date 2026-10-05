@@ -11,6 +11,8 @@ import sqlite3
 import time
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from decimal import Decimal as D, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 
@@ -27,11 +29,17 @@ RESERVE = D('1.20')
 TERMINAL = {'FILLED', 'CANCELED', 'PARTIALLY_CANCELED', 'REJECTED', 'EXPIRED'}
 
 
-def agent_context(controller, strategies, reconciliation, repricing, *, include_wallet=True):
+def agent_context(controller, strategies, reconciliation, repricing, *, include_wallet=True,
+                  include_transfers=True):
     if strategies is None or reconciliation is None or not controller.rebalance_lock_path:
         raise ValueError('Contesto rebalance locale non configurato')
     rows = strategies.status()['strategies']
     tickers = sorted({s['spec'][r]['ticker'] for s in rows for r in ('base', 'quote')})
+    if not include_transfers:
+        # Spot targets still need the real spendable amount for auto sizing.
+        # Fixed quantities are explicit; no receiving-coin balance is needed.
+        tickers = sorted({spec.sold.ticker for row in rows
+                          if (spec := StrategySpec.from_payload(row['spec'])).quantity_mode == 'auto'})
     from .vps_controller import _numeric_decimal
     wallet = {}
     for ticker in tickers if include_wallet else ():
@@ -47,7 +55,7 @@ def agent_context(controller, strategies, reconciliation, repricing, *, include_
         raise ValueError('Risposta swap KDF incompleta')
     refunded_reader = getattr(strategies, 'refunded_swap_uuids', None)
     refunded_swap_uuids = list(refunded_reader()) if callable(refunded_reader) else []
-    return {'strategies': rows, 'wallet': wallet,
+    return {'strategies': rows, 'wallet': wallet, 'include_transfers': include_transfers,
             'journal': controller.rebalance_lock_path.removesuffix('.rebalance.lock'),
             'refunded_swap_uuids': refunded_swap_uuids,
             'reconciliation': reconciliation.payload(),
@@ -72,9 +80,11 @@ def free_balances(account, *, venue='CEX'):
 
 def fingerprint(context):
     # Ignore volatile confirmations, previews and log details, not quantities/budgets.
-    rows = [{'spec': r['spec'], 'remaining': r['remaining_sold'], 'enabled': r['enabled'],
+    rows = [{'spec': r['spec'], 'remaining': r['remaining_sold'],
+             'daily_remaining': r.get('daily_remaining_sold'), 'enabled': r['enabled'],
              'state': r['state']} for r in context['strategies']]
     return hashlib.sha256(json.dumps({'rows': rows, 'open_quotes': context.get('open_quotes', []),
+        'wallet': context.get('wallet', {}),
         'fee': context['fee'], 'buffer': context['buffer'],
         'daily_fraction': context['daily_fraction']}, sort_keys=True).encode()).hexdigest()
 
@@ -82,9 +92,8 @@ def fingerprint(context):
 def _auto_strategy_exclusion(spec, diagnostic):
     """Describe an auto strategy that cannot currently produce a stable quote.
 
-    Rebalance uses synthetic unlimited balances while sizing targets, so this
-    condition is a market/strategy-size constraint, never evidence that the
-    user should deposit more funds on MEXC.
+    Auto sizing uses the spendable KDF balance and market/strategy limits.
+    A target below the stable minimum does not imply missing CEX funds.
     """
     maximum = D(diagnostic['maximum'])
     minimum = D(diagnostic['minimum'])
@@ -112,8 +121,8 @@ def _auto_strategy_exclusion(spec, diagnostic):
         )
     else:
         action = (
-            "attendere maggiore profondità o aumentare il limite/budget che restringe "
-            "la strategia; anche il 100% auto non raggiunge ora il margine stabile"
+            "verificare il saldo KDF spendibile e i limiti/budget, oppure attendere "
+            "maggiore profondità; anche il 100% auto non raggiunge ora il margine stabile"
         )
     return {
         'strategy_id': spec.strategy_id,
@@ -133,32 +142,97 @@ def _auto_strategy_exclusion(spec, diagnostic):
     }
 
 
-def coverage_targets(context, snapshots, *, warnings=None, excluded=None):
-    """CEX is pre-funded across all legs; KDF shares only across different pairs."""
+def coverage_targets(context, snapshots, *, warnings=None, excluded=None, sizing=None):
+    """Fund published quotes, or bounded next quotes when none is published.
+
+    Only CEX balances are synthetic: rebalance asks what inventory is needed
+    to hedge the wallet, not how much unlimited wallet inventory could trade.
+    KDF shares funds across different pairs, while same-pair levels add up.
+    """
     cex = defaultdict(D)
     pools = defaultdict(lambda: defaultdict(D))
     routes = {}
     reserved_depth = defaultdict(D)
     fee = number(context['fee'], 'fee', positive=False)
+    specs = {}
+    rows = {}
     for row in context['strategies']:
         if row['state'] == 'DELETED':
             continue
         spec = StrategySpec.from_payload(row['spec'])
-        remaining = None if spec.replenish else number(row['remaining_sold'], 'budget', positive=False)
-        if remaining == 0:
-            continue
+        sid = row.get('id', spec.strategy_id)
+        if sid != spec.strategy_id or sid in specs:
+            raise ValueError('Identità della strategia non valida o duplicata')
+        specs[sid], rows[sid] = spec, row
         for route in (spec.sold, spec.bought):
             if route.ticker in routes and routes[route.ticker] != route.asset:
                 raise ValueError(f"Mapping {spec.cex} ambiguo: " + route.ticker)
             routes[route.ticker] = route.asset
+
+    def record(spec, quantity, price, basis, requirements, limits=None):
+        if sizing is not None:
+            sizing.append({'strategy_id': spec.strategy_id,
+                'number': rows[spec.strategy_id].get('creation_number', spec.strategy_id),
+                'sell': spec.sold.ticker, 'buy': spec.bought.ticker,
+                'quantity': str(quantity), 'price': str(price), 'basis': basis,
+                'limits': limits or {},
+                'targets': {a: str(q * RESERVE) for a, q in requirements.items()}})
+
+    published = set()
+    # Current liabilities take priority over future configurations. Never add
+    # an unlimited replacement estimate on top of the same published maker.
+    for quote in context.get('open_quotes', []):
+        sid = quote['strategy_id']
+        spec = specs.get(sid)
+        if spec is None:
+            raise ValueError('Configurazione di un ordine pubblicato non disponibile')
+        sold = number(quote['volume'], 'quantità pubblicata')
+        price = number(quote['price'], 'prezzo pubblicato')
+        requirements = defaultdict(D)
+        for route, side, amount in ((spec.sold, 'BUY', sold), (spec.bought, 'SELL', sold * price)):
+            if not route.symbol:
+                continue
+            snapshot = snapshots[route.symbol]
+            reserved_depth[(route.symbol, side)] += amount
+            amount = (amount / snapshot.quantity_step).to_integral_value(rounding=ROUND_CEILING) * snapshot.quantity_step
+            asset = 'USDT' if side == 'BUY' else route.asset
+            if side == 'BUY':
+                amount *= snapshot.order_book().asks[0].price * (1 + spec.impact)
+            requirements[asset] += amount * (1 + fee)
+        for asset, amount in requirements.items():
+            cex[asset] += amount
+        pools[spec.sold.ticker][spec.bought.ticker] += sold
+        published.add(sid)
+        record(spec, sold, price, 'published', requirements)
+
+    for sid, spec in specs.items():
+        if sid in published:
+            continue
+        row = rows[sid]
+        remaining = spec.max_sold if spec.replenish else number(row['remaining_sold'], 'budget', positive=False)
+        daily = (number(row.get('daily_remaining_sold', spec.daily_sold_cap), 'budget giornaliero', positive=False)
+                 if spec.daily_sold_cap is not None else None)
+        if remaining == 0 or daily == 0:
+            continue
+        # Fixed funding has an explicit finite quantity, not a wallet estimate.
+        kdf_free = spec.fixed_sold
+        if spec.quantity_mode == 'auto':
+            wallet = context.get('wallet', {}).get(spec.sold.ticker, {})
+            if 'free' not in wallet:
+                raise ValueError(f'{spec.sold.ticker}: saldo KDF spendibile non disponibile; '
+                                 'impossibile dimensionare il target automatico, aggiornare e riprovare')
+            available = number(wallet['free'], 'saldo KDF', positive=False)
+            committed = pools[spec.sold.ticker][spec.bought.ticker]
+            kdf_free = max(D(0), available - committed)
         # Budget exhaustion may leave a smaller last order than fixed_sold.
         from dataclasses import replace
         if remaining is not None and spec.fixed_sold is not None:
             spec = replace(spec, fixed_sold=min(spec.fixed_sold, remaining))
         preview_args = dict(
-            kdf_free=D('1e30'),
+            kdf_free=kdf_free,
             cex_free={r.asset: D('1e30') for r in (spec.base, spec.quote)} | {'USDT': D('1e30')},
             remaining_budget=remaining,
+            daily_remaining=daily,
             fee=fee,
             buffer=D(context['buffer']),
             daily_volume_fraction=D(context['daily_fraction']),
@@ -179,58 +253,51 @@ def coverage_targets(context, snapshots, *, warnings=None, excluded=None):
         )
         if warnings is not None and spec.quantity_mode == 'fixed':
             try:
-                preview_strategy(spec, snapshots, kdf_free=D('1e30'),
+                preview_strategy(spec, snapshots, kdf_free=spec.fixed_sold,
                     cex_free={r.asset: D('1e30') for r in (spec.base, spec.quote)} | {'USDT': D('1e30')},
-                    remaining_budget=remaining, fee=fee, buffer=D(context['buffer']),
+                    remaining_budget=remaining, daily_remaining=daily,
+                    fee=fee, buffer=D(context['buffer']),
                     daily_volume_fraction=D(context['daily_fraction']), reserved_hedges=reserved_depth)
             except ValueError:
                 warnings.append(f"{spec.sold.ticker} → {spec.bought.ticker}: liquidità/minimi {spec.cex} non compatibili con la quantità fissa {preview.plan.kdf_volume}. "
                                 "La riserva è calcolata sull'intera quantità configurata, senza ridurla. Riequilibrare i saldi non risolve un limite del book.")
         pools[spec.sold.ticker][spec.bought.ticker] += preview.plan.kdf_volume
+        requirements = defaultdict(D)
         for leg in preview.hedge_legs:
             qty = D(leg['quantity'])
             reserved_depth[(leg['symbol'], leg['side'])] += qty
             step = D(leg['quantity_step'])
             qty = (qty / step).to_integral_value(rounding=ROUND_CEILING) * step
             asset = 'USDT' if leg['side'] == 'BUY' else leg['asset']
-            cex[asset] += qty * (D(leg['limit_price']) if asset == 'USDT' else 1) * (1 + fee)
-    opened = defaultdict(D)
-    specs = {row['id']: StrategySpec.from_payload(row['spec']) for row in context['strategies']}
-    for quote in context.get('open_quotes', []):
-        spec = specs.get(quote['strategy_id'])
-        if spec is None:
-            continue
-        sold = number(quote['volume'], 'quantità pubblicata')
-        bought = sold * number(quote['price'], 'prezzo pubblicato')
-        for route, side, amount in ((spec.sold, 'BUY', sold), (spec.bought, 'SELL', bought)):
-            if not route.symbol:
-                continue
-            snapshot = snapshots[route.symbol]
-            if side == 'BUY':
-                amount = (amount / snapshot.quantity_step).to_integral_value(rounding=ROUND_CEILING) * snapshot.quantity_step
-                asset = 'USDT'
-                amount *= snapshot.order_book().asks[0].price * (1 + spec.impact)
-            else:
-                asset = route.asset
-            opened[asset] += amount * (1 + fee)
-    for asset, amount in opened.items():
-        cex[asset] = max(cex[asset], amount)
+            requirements[asset] += qty * (D(leg['limit_price']) if asset == 'USDT' else 1) * (1 + fee)
+        for asset, amount in requirements.items():
+            cex[asset] += amount
+        record(spec, preview.plan.kdf_volume, preview.plan.kdf_price,
+               'wallet_bounded_auto' if spec.quantity_mode == 'auto' else 'configured_fixed',
+               requirements, {k: str(v) for k, v in preview.caps_sold.items()})
     return ({a: q * RESERVE for a, q in cex.items()},
             {a: max(pairs.values()) for a, pairs in pools.items()}, routes)
 
 
 def propose(context, snapshots, balances):
     venue = str(context.get('venue') or 'CEX')
-    notes, excluded = [], []
+    notes, excluded, sizing = [], [], []
     try:
         targets, kdf, routes = coverage_targets(
-            context, snapshots, warnings=notes, excluded=excluded
+            context, snapshots, warnings=notes, excluded=excluded, sizing=sizing
         )
     except ValueError as exc:
         explanation = 'Analisi copertura incompleta: ' + str(exc) + ' Nessun trade o trasferimento suggerito; verificare le strategie indicate e aggiornare il mercato.'
         return {'targets': {}, 'kdf_targets': {}, 'orders': [], 'transfers': [],
-                'notes': [explanation], 'strategy_actions': excluded,
+                'notes': [explanation], 'strategy_actions': excluded, 'sizing': [],
                 'transfer_blockers': [explanation], 'fingerprint': fingerprint(context)}
+    for item in sizing:
+        basis = {'published': 'quantità effettivamente pubblicata',
+                 'wallet_bounded_auto': 'prossimo ordine auto, limitato dal saldo spendibile KDF e dai limiti della strategia/mercato',
+                 'configured_fixed': 'quantità fissa configurata'}[item['basis']]
+        amounts = ', '.join(f'{q} {a}' for a, q in item['targets'].items())
+        notes.append(f"Maker #{item['number']} {item['sell']} → {item['buy']}: "
+                     f"{item['quantity']} {item['sell']} ({basis}); target {amounts}, già inclusi commissioni e riserva del 20%.")
     free = {a: b['free'] for a, b in balances.items()}
     orders, transfers = [], []
     fee = D(context['fee'])
@@ -313,6 +380,7 @@ def propose(context, snapshots, balances):
                            'missing': str(max(D(0), q - free.get(a, D(0))))} for a, q in targets.items()},
             'orders': orders, 'transfers': transfers, 'notes': notes,
             'strategy_actions': excluded,
+            'sizing': sizing,
             'fingerprint': fingerprint(context)}
 
 
@@ -375,11 +443,18 @@ def _commission_payload(payload):
 
 class CexRebalanceService:
     def __init__(self, api, settings, journal_path, *, venue='MEXC', profile='default', client=None,
-                 strategy_ids=None):
+                 strategy_ids=None, public_client_factory=None):
         from .venues import normalize_cex
         self.api, self.settings, self.journal_path = api, settings, str(Path(journal_path).resolve())
         self.venue, self.profile, self._client = normalize_cex(venue), profile, client
         self.strategy_ids = None if strategy_ids is None else frozenset(strategy_ids)
+        # Injected clients remain caller-owned and sequential. Production uses
+        # independent public-only readers, never parallel signing clients.
+        self._public_client_factory = public_client_factory
+        if client is None and public_client_factory is None:
+            from .exchanges import create_public_reader
+            self._public_client_factory = lambda: create_public_reader(self.venue,
+                base_url=getattr(self.settings, self.venue.lower() + '_base_url', None))
 
     @property
     def client(self):
@@ -449,6 +524,107 @@ class CexRebalanceService:
         except sqlite3.Error:
             return ()
 
+    def _market_snapshots(self, rules_by_symbol, deadline, identity):
+        from .network_diagnostics import emit as diagnostic
+        symbols = sorted(rules_by_symbol)
+        if not symbols:
+            return {}
+
+        def read(reader, method, symbol, **kwargs):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError(f'Lettura {self.venue} troppo lenta: riprovare, nessun piano valido')
+            if getattr(reader, 'supports_read_deadlines', False):
+                kwargs.update(timeout=min(4.0, remaining), total_timeout=min(4.0, remaining))
+            started, observed = time.monotonic(), time.time_ns() // 1_000_000
+            outcome, kind = 'received', None
+            diagnostic('rebalance_read_start', request_id=identity, venue=self.venue,
+                       method=method, symbol=symbol, started_at_ms=observed)
+            try:
+                return getattr(reader, method)(symbol, **kwargs), observed
+            except Exception as exc:
+                outcome, kind = 'error', type(exc).__name__
+                raise
+            finally:
+                diagnostic('rebalance_read_end', request_id=identity, venue=self.venue,
+                           method=method, symbol=symbol, outcome=outcome, failure_kind=kind,
+                           elapsed_ms=round((time.monotonic() - started) * 1000, 2))
+
+        def original_time(value, requested):
+            if value is None:
+                return requested
+            if type(value) is not int or value <= 0 or value > time.time_ns() // 1_000_000:
+                raise ValueError('Timestamp di mercato non valido durante l’analisi')
+            # Preserve older observations; a response must never rejuvenate data.
+            return min(value, requested)
+
+        with ExitStack() as cleanup:
+            if self._public_client_factory is None:
+                readers = [self.client]
+            else:
+                readers = []
+                for _ in range(min(4, len(symbols))):
+                    reader = self._public_client_factory()
+                    readers.append(reader)
+                    close = getattr(reader, 'close', None)
+                    if callable(close):
+                        cleanup.callback(close)
+            lanes = [(reader, symbols[index::len(readers)])
+                     for index, reader in enumerate(readers)]
+
+            def phase(lane, method):
+                reader, assigned = lane
+                return {symbol: read(reader, method, symbol,
+                        **({'limit': self.settings.mexc_depth_limit} if method == 'order_book' else {}))
+                        for symbol in assigned}
+
+            if len(readers) == 1:
+                tickers = phase(lanes[0], 'ticker_24h')
+                books = phase(lanes[0], 'order_book')
+            else:
+                with ThreadPoolExecutor(max_workers=len(readers), thread_name_prefix='rebalance-public') as pool:
+                    # All slow metadata precedes every book. Each lane has its
+                    # own plugin host: its RPC lock cannot serialize the markets.
+                    tickers = {symbol: value for part in pool.map(
+                        lambda lane: phase(lane, 'ticker_24h'), lanes) for symbol, value in part.items()}
+                    books = {symbol: value for part in pool.map(
+                        lambda lane: phase(lane, 'order_book'), lanes) for symbol, value in part.items()}
+            snapshots = {}
+            for symbol in symbols:
+                book, requested = books[symbol]
+                ticker, ticker_requested = tickers[symbol]
+                rules = rules_by_symbol[symbol]
+                if not book.bids or not book.asks:
+                    raise ValueError(f'{symbol}: book incompleto durante l’analisi')
+                snapshots[symbol] = MarketSnapshot(0, symbol,
+                    original_time(book.observed_at_ms, requested),
+                    tuple((str(l.price), str(l.quantity)) for l in book.bids),
+                    tuple((str(l.price), str(l.quantity)) for l in book.asks),
+                    number(ticker['volume'], 'volume', positive=False), D(0), D(0),
+                    rules.quantity_step, rules.price_step, rules.min_quote_amount, 'local-read',
+                    volume_observed_at_ms=original_time(ticker.get('_observed_at_ms'), ticker_requested))
+        return snapshots
+
+    def _check_market_freshness(self, snapshots, deadline, identity):
+        from .network_diagnostics import emit as diagnostic
+        now_ms = time.time_ns() // 1_000_000
+        stale = []
+        for symbol, snapshot in snapshots.items():
+            book_age = now_ms - snapshot.observed_at_ms
+            volume_age = now_ms - snapshot.volume_observed_at_ms
+            reason = ('stale_book' if not 0 <= book_age <= 10000 else
+                      'stale_volume' if not 0 <= volume_age <= 15000 else None)
+            diagnostic('rebalance_market_check', request_id=identity, venue=self.venue,
+                       symbol=symbol, now_ms=now_ms, book_age_ms=book_age, volume_age_ms=volume_age,
+                       book_max_age_ms=10000, volume_max_age_ms=15000, reason=reason,
+                       outcome='error' if reason else 'fresh')
+            if reason:
+                stale.append(symbol)
+        if time.monotonic() > deadline:
+            raise ValueError(f'Lettura {self.venue} troppo lenta: riprovare, nessun piano valido')
+        if stale:
+            raise ValueError('Dati di mercato scaduti durante l’analisi (' + ', '.join(stale) + '): riprovare')
+
     def preview(self):
         self._synchronize()
         full_context = self.api.get('/v1/rebalance/context')
@@ -456,8 +632,9 @@ class CexRebalanceService:
             raise ValueError('Sono presenti quotazioni legacy: rimuoverle o convertirle in strategie prima del rebalance')
         context = self._context(full_context)
         started = time.time()
+        deadline, identity = time.monotonic() + 30, uuid.uuid4().hex
         balances = free_balances(self.client.account(), venue=self.venue)
-        snapshots = {}
+        rules_by_symbol = {}
         symbols = sorted({r['spec'][key]['symbol'] for r in context['strategies']
                           for key in ('base', 'quote')} - {None})
         for symbol in symbols:
@@ -469,22 +646,9 @@ class CexRebalanceService:
                              for k in ('makerCommission', 'takerCommission'))
             if actual_fee > D(context['fee']):
                 raise ValueError(f'{symbol}: commissione {self.venue} maggiore di quella configurata; aggiornare il margine commissioni')
-            book_started_ms = time.time_ns() // 1000000
-            book = self.client.order_book(symbol, limit=self.settings.mexc_depth_limit)
-            ticker_started_ms = time.time_ns() // 1000000
-            ticker = self.client.ticker_24h(symbol)
-            snapshots[symbol] = MarketSnapshot(0, symbol, book_started_ms,
-                tuple((str(l.price), str(l.quantity)) for l in book.bids),
-                tuple((str(l.price), str(l.quantity)) for l in book.asks),
-                number(ticker['volume'], 'volume', positive=False), D(0), D(0),
-                rules.quantity_step, rules.price_step, rules.min_quote_amount, 'local-read',
-                volume_observed_at_ms=ticker_started_ms)
-        if time.time() - started > 30:
-            raise ValueError(f'Lettura {self.venue} troppo lenta: riprovare, nessun piano valido')
-        now_ms = time.time_ns() // 1000000
-        if any(now_ms - s.observed_at_ms > 10000 or now_ms - s.volume_observed_at_ms > 15000
-               for s in snapshots.values()):
-            raise ValueError('Dati di mercato scaduti durante l’analisi: riprovare')
+            rules_by_symbol[symbol] = rules
+        snapshots = self._market_snapshots(rules_by_symbol, deadline, identity)
+        self._check_market_freshness(snapshots, deadline, identity)
         result = propose(context, snapshots, balances)
         from .hedge_unwind import protect_failed_hedge_inventory
         permitted = []
@@ -505,6 +669,7 @@ class CexRebalanceService:
             else:
                 permitted.append(item)
         result['orders'] = permitted
+        self._check_market_freshness(snapshots, deadline, identity)
         for item in result['orders']:
             item['cex'] = self.venue
         result['cex'] = self.venue
@@ -575,7 +740,9 @@ class CexRebalanceService:
             raise ValueError('Proposta assente o scaduta: ricalcolare')
         from .rebalance_guard import rebalance_guard
         from .local_worker import rebalance_worker_access
-        with rebalance_guard(self.journal_path + '.rebalance.lock', exclusive=True), rebalance_worker_access(self.journal_path):
+        with rebalance_guard(self.journal_path + '.rebalance.lock', exclusive=True, wait_seconds=20,
+                busy_message='Attesa rebalance terminata: un ciclo CEX o una pubblicazione KDF non si è ancora concluso. '
+                             'Questa richiesta non ha inviato ordini. Attendere, poi eseguire una nuova analisi.'), rebalance_worker_access(self.journal_path):
             full_context = self.api.get('/v1/rebalance/context')
             assert_idle(full_context, self.journal_path)
             context = self._context(full_context)

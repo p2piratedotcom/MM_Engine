@@ -78,10 +78,10 @@ def rebalance_worker_access(journal_path):
 
 
 def coordinated_cycle(runtime, journal_path):
-    from .rebalance_guard import rebalance_guard
+    from .rebalance_guard import worker_cycle_guard
     from .desktop_runtime import DesktopRuntimeResult
     try:
-        with rebalance_guard(str(journal_path) + '.rebalance.lock'):
+        with worker_cycle_guard(str(journal_path) + '.rebalance.lock'):
             return runtime()
     except ValueError as exc:
         return DesktopRuntimeResult(sync=None, coverage=None, hedging=None, errors={'rebalance': str(exc)})
@@ -99,6 +99,8 @@ class LocalMexcWorker:
         from .exchanges.plugin_catalog import installed_plugins
         if settings.auto_hedge and not settings.live_trading:
             raise ValueError("copertura live richiede KDF_MM_LIVE_TRADING=true")
+        from .network_diagnostics import configure
+        configure(Path(settings.desktop_journal_db).parent / "worker-network-diagnostics.jsonl")
         keyring = LinuxSecretService(profile=profile)
         self.lock = WorkerLock(settings.desktop_journal_db, cooperative=True)
         self.lock.__enter__()

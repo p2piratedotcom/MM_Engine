@@ -797,6 +797,8 @@ def build_controller(
 ) -> VpsController:
     state_path = Path(settings.state_db)
     state_path.parent.mkdir(parents=True, exist_ok=True)
+    from .network_diagnostics import configure
+    configure(state_path.parent / "engine-network-diagnostics.jsonl")
     ownership = OrderOwnershipStore(state_path)
     kdf = KdfRpcClient(
         rpc_url=settings.kdf_rpc_url,
