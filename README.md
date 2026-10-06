@@ -1,5 +1,13 @@
 # MM_Engine
 
+## Start here with an AI or as a new contributor
+
+Read [AGENTS.md](AGENTS.md) first, then the [AI/contributor project guide](docs/AI_PROJECT_GUIDE.md).
+They explain repository scope, architecture, safe setup, limits and cross-repository
+contracts. Relevant behavior/contract changes must review these guides in the same
+PR; use the guide-maintenance section of the PR template.
+
+
 Standalone P2Pirate market maker engine extracted from the KDF Market Maker
 Bot project. It creates KDF maker orders using MEXC or Gate spot data, adjusts
 quotes and available amounts, and records CEX hedge intents and outcomes. The
