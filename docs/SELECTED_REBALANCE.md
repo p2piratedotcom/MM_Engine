@@ -100,3 +100,25 @@ All old uncertain-send/publication/hedge locks remain in force.
 Venue constraints are grounded in the adapter's normalized rules and current
 responses; see [MEXC Spot API](https://www.mexc.io/api-docs/spot-v3/introduction)
 and [Binance Spot filters](https://github.com/binance/binance-spot-api-docs/blob/master/filters.md).
+
+
+## Shared display balance refresh
+
+MY CEXs and CEX REBALANCE keep independent venue/collapse controls but subscribe
+to one page-owned balance source. One timer schedules refreshes for the distinct
+visible venues; concurrent requests for the same venue await the same future.
+Rows, loading/error state, original receipt timestamp and next-refresh countdown
+are shared, and failures retain the last received balances. Hidden sections do
+not schedule reads unless another visible section needs that venue. Credential
+or engine changes invalidate the shared generation, so old replies are ignored.
+Rebalance status polling invalidates display balances only when trade history
+changes; an empty/unchanged status does not restart balance reads.
+
+The authenticated display endpoint also uses one persistent reader per wallet
+handler with per-venue locks and a two-second burst cache. This includes failures
+to prevent concurrent consumers immediately repeating a failed time sync.
+Credential replacement invalidates that display cache before/after storing.
+This display cache never grants trading coverage; Analyze/Execute/live-worker
+account freshness and time-sync limits remain unchanged. Error messages separate
+the public time-sync phase from credential/account permission checks. Metadata
+from the adapter carries safe failure categories, not raw exceptions or URLs.

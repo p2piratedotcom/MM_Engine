@@ -147,6 +147,12 @@ def handler_factory(
             hmac.compare_digest(wallet_worker_token, token)):
         raise ValueError("wallet worker requires a separate private token")
 
+    # Persist one read-only display lane for all wallet balance HTTP requests.
+    from .exchanges.balances import PreviewBalances
+    from .credentials import LinuxSecretService
+    display_balances = PreviewBalances(
+        keyring_factory=lambda: LinuxSecretService(profile=cex_profile)) if wallet_mode else None
+
     class AgentHandler(BaseHTTPRequestHandler):
         server_version = "KdfMmAgent/0.1"
 
@@ -179,8 +185,7 @@ def handler_factory(
                     from .credentials import LinuxSecretService
                     from .venues import normalize_cex
                     venue = normalize_cex(parse_qs(urlparse(self.path).query).get("venue", ["MEXC"])[0])
-                    reader = PreviewBalances(keyring_factory=lambda: LinuxSecretService(profile=cex_profile))
-                    balances = reader.read_account(venue)
+                    balances = display_balances.read_account(venue)
                     self._json(200, {"venue": venue, "read_only": True,
                         "balances": [{"ticker": key, "available": str(value)}
                                      for key, value in balances.items()]})
@@ -432,11 +437,15 @@ def handler_factory(
                             or not 1 <= len(api_secret) <= 512):
                         raise ValueError("credenziali o conferma non valide")
                     keyring = LinuxSecretService(profile=cex_profile)
+                    if display_balances is not None:
+                        display_balances.invalidate_display()
                     if wallet_rebalance is not None:
                         wallet_rebalance.store_credentials(venue,
                             lambda: keyring.store(venue, MexcCredentials(api_key, api_secret)))
                     else:
                         keyring.store(venue, MexcCredentials(api_key, api_secret))
+                    if display_balances is not None:
+                        display_balances.invalidate_display()
                     result = {"stored": venue}
                 elif path.startswith('/v1/wallet/send/'):
                     if wallet_send is None:
