@@ -250,6 +250,8 @@ class SpotPluginClient:
                         status=error.get("status"), payload={"code": error.get("code")},
                         execution_unknown=bool(error.get("execution_unknown")))
                     exc.venue = self.item["venue"]
+                    exc.failure_kind = failure_kind
+                    exc.phase = phase
                     raise exc
                 result = decode(response["result"])
                 if isinstance(result, OrderBook) and (
@@ -268,6 +270,8 @@ class SpotPluginClient:
                 unknown = method in ("place_limit_order", "cancel_order")
                 exc = MexcError(f"{self.item['venue']} plugin unavailable", execution_unknown=unknown)
                 exc.venue = self.item["venue"]
+                exc.failure_kind = failure_kind
+                exc.phase = phase
                 raise exc from None
             finally:
                 diagnostic('plugin_request_end', request_id=identity, venue=self.item['venue'],

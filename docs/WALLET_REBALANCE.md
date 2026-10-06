@@ -1,3 +1,8 @@
+> The new GUI uses [selected maker/coin rebalance](SELECTED_REBALANCE.md) in
+> its separate CEX REBALANCE card. The implicit scope described below remains
+> the legacy TUI/API policy. GUI requests add `asset_percentages` and optional
+> `allocation_id`; repeated Analyze preserves absolute spending envelopes.
+
 # Spot rebalance in P2Pirate Desktop
 
 The wallet uses the same `CexRebalanceService` policy as the TUI through the
@@ -41,6 +46,7 @@ The operator-only raw rebalance context remains inaccessible in wallet mode.
 | POST route | Body | Effect |
 | --- | --- | --- |
 | `/v1/rebalance/analyze` | `venue`, optional `strategy_ids` | Read-only CEX/KDF analysis, server-owned proposal ID, expiry, targets, trades, blockers |
+| `/v1/rebalance/ideal` | `venue`, explicit `strategy_ids`, optional `allocation_id` | Local persisted maker reference; no CEX/KDF network requests; short-lived server-owned `ideal_id` for selected Analyze |
 | `/v1/rebalance/execute` | `venue`, `id`, `confirmation: "EXECUTE REBALANCE <id>"` | Consume stored proposal and submit its first validated LIMIT trade |
 | `/v1/rebalance/status` | `venue` | Query pending trade IDs; reconcile local journal without new orders |
 

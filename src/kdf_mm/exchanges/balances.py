@@ -18,27 +18,68 @@ class PreviewBalances:
         self.clock = clock
         self._lock = threading.Lock()
         self._snapshots = {}
+        self._display_state = threading.Lock()
+        self._display_locks = {}
+        self._display_cache = {}
+        self._display_generation = 0
+
+    def invalidate_display(self):
+        # A replaced credential/session may not publish an old account reply.
+        with self._display_state:
+            self._display_generation += 1
+            self._display_cache.clear()
 
     def read_account(self, venue):
-        """Display balances without requiring permission to place hedge orders."""
+        """Single display read per venue; short burst cache never grants coverage."""
         config = load_config(venue)
-        stage = 'caricamento credenziali'
-        try:
-            client = self.client_factory(venue, self.keyring_factory(),
-                base_url=self.base_urls.get(venue), trading_enabled=False)
-            stage = 'sincronizzazione orario'
-            client.synchronize_time(max_round_trip_ms=config.time_sync_budget_ms)
-            stage = 'lettura account Spot'
-            account = client.account(timeout=config.private_read_timeout,
-                total_timeout=config.private_read_timeout)
-            stage = 'verifica formato saldi'
-            return DesktopCoveragePublisher._balances(account, venue=venue,
-                require_trading=False)
-        except Exception as exc:
-            status = getattr(exc, 'status', None)
-            detail = f'HTTP {status}' if isinstance(status, int) else type(exc).__name__
-            raise ValueError(f'{venue}: {stage} fallita ({detail}). '
-                'Verificare Spot Account Read e connessione Tor; riprovare.') from None
+        with self._display_state:
+            lock = self._display_locks.setdefault(venue, threading.Lock())
+        with lock:
+            with self._display_state:
+                generation = self._display_generation
+                previous = self._display_cache.get(venue)
+                if previous is not None and self.clock() - previous[0] < 2:
+                    if previous[2] is not None:
+                        raise ValueError(previous[2])
+                    return dict(previous[1])
+            stage = 'caricamento credenziali'
+            error = None
+            result = None
+            try:
+                client = self.client_factory(venue, self.keyring_factory(),
+                    base_url=self.base_urls.get(venue), trading_enabled=False)
+                stage = 'sincronizzazione orario'
+                client.synchronize_time(max_round_trip_ms=config.time_sync_budget_ms)
+                stage = 'lettura account Spot'
+                account = client.account(timeout=config.private_read_timeout,
+                    total_timeout=config.private_read_timeout)
+                stage = 'verifica formato saldi'
+                result = DesktopCoveragePublisher._balances(account, venue=venue,
+                    require_trading=False)
+            except Exception as exc:
+                status = getattr(exc, 'status', None)
+                kind = getattr(exc, 'failure_kind', None)
+                cause = getattr(exc, '__cause__', None)
+                if kind is None:
+                    kind = getattr(cause, 'kind', None)
+                detail = f'HTTP {status}' if isinstance(status, int) else type(exc).__name__
+                if stage == 'sincronizzazione orario':
+                    detail = 'timeout' if kind == 'timeout' else detail
+                    error = (f'{venue}: sincronizzazione orario non completata ({detail}). '
+                             'Il server orario pubblico non è stato verificato entro i limiti. '
+                             'Riprovare; la lettura dei saldi non è ancora iniziata.')
+                elif stage == 'caricamento credenziali':
+                    error = f'{venue}: credenziali non disponibili ({detail}). Configurare le chiavi e riprovare.'
+                else:
+                    error = (f'{venue}: {stage} fallita ({detail}). '
+                             'Verificare Spot Account Read e connessione; riprovare.')
+            with self._display_state:
+                if generation != self._display_generation:
+                    raise ValueError(f'{venue}: credenziali cambiate durante la lettura; aggiornare i saldi')
+                self._display_cache[venue] = (self.clock(), result, error)
+            if error is not None:
+                raise ValueError(error) from None
+            return dict(result)
 
     def __call__(self, venue):
         with self._lock:

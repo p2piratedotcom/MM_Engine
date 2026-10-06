@@ -84,7 +84,8 @@ def fingerprint(context):
              'daily_remaining': r.get('daily_remaining_sold'), 'enabled': r['enabled'],
              'state': r['state']} for r in context['strategies']]
     return hashlib.sha256(json.dumps({'rows': rows, 'open_quotes': context.get('open_quotes', []),
-        'wallet': context.get('wallet', {}),
+        'wallet': {} if context.get('ideal') else context.get('wallet', {}),
+        'allocation': context.get('allocation'), 'ideal': context.get('ideal'), 'protected_targets': context.get('protected_targets', {}),
         'fee': context['fee'], 'buffer': context['buffer'],
         'daily_fraction': context['daily_fraction']}, sort_keys=True).encode()).hexdigest()
 
@@ -443,11 +444,15 @@ def _commission_payload(payload):
 
 class CexRebalanceService:
     def __init__(self, api, settings, journal_path, *, venue='MEXC', profile='default', client=None,
-                 strategy_ids=None, public_client_factory=None):
+                 strategy_ids=None, public_client_factory=None,
+                 asset_percentages=None, allocation_id=None, ideal=None):
         from .venues import normalize_cex
         self.api, self.settings, self.journal_path = api, settings, str(Path(journal_path).resolve())
         self.venue, self.profile, self._client = normalize_cex(venue), profile, client
         self.strategy_ids = None if strategy_ids is None else frozenset(strategy_ids)
+        self.asset_percentages = asset_percentages
+        self.allocation_id = allocation_id
+        self.ideal = ideal
         # Injected clients remain caller-owned and sequential. Production uses
         # independent public-only readers, never parallel signing clients.
         self._public_client_factory = public_client_factory
@@ -631,28 +636,88 @@ class CexRebalanceService:
         if full_context['repricing'].get('quotes'):
             raise ValueError('Sono presenti quotazioni legacy: rimuoverle o convertirle in strategie prima del rebalance')
         context = self._context(full_context)
+        if self.ideal is not None:
+            from .rebalance_ideal import covers_open, maker_key
+            if self.ideal['maker_key']!=maker_key(context['strategies']):
+                raise ValueError('Configurazione o budget maker cambiato: ricalcolare la copertura ideale')
+            if number(self.ideal['fee'],'commissione del riferimento',positive=False)!=D(context['fee']):
+                raise ValueError('Commissione configurata cambiata: ricalcolare la copertura ideale')
+            if not covers_open(self.ideal,context.get('open_quotes',[])):
+                raise ValueError('Obblighi degli ordini aperti aumentati: ricalcolare la copertura ideale')
         started = time.time()
         deadline, identity = time.monotonic() + 30, uuid.uuid4().hex
         balances = free_balances(self.client.account(), venue=self.venue)
+        if self.asset_percentages is not None:
+            from .rebalance_allocation import resolve
+            context['allocation'] = resolve(self, balances)
+            context['ideal'] = self.ideal
+            # Preserve liabilities of non-selected active/open makers too.
+            venue_context = _venue_context(full_context, self.venue, self.configured_fee)
+            opened = {q['strategy_id'] for q in venue_context['open_quotes']}
+            protected_context = dict(venue_context, strategies=[r for r in venue_context['strategies']
+                if r['id'] not in self.strategy_ids and (r['enabled'] or r['id'] in opened)],
+                open_quotes=[q for q in venue_context['open_quotes'] if q['strategy_id'] not in self.strategy_ids])
+        else:
+            protected_context = None
         rules_by_symbol = {}
         symbols = sorted({r['spec'][key]['symbol'] for r in context['strategies']
                           for key in ('base', 'quote')} - {None})
+        if protected_context is not None:
+            symbols = sorted(set(symbols) | {r['spec'][key]['symbol'] for r in protected_context['strategies']
+                for key in ('base', 'quote')} - {None})
+        required_symbols = set(symbols)
+        extra_assets = set(self.asset_percentages or {}) - {'USDT'}
+        symbols = sorted(required_symbols | {a + 'USDT' for a in extra_assets})
+        if self.asset_percentages is not None and len(symbols) > 16:
+            raise ValueError('Troppe coppie in una singola analisi: selezionare al massimo 16 mercati')
+        unavailable = []
+        allowed_symbols = None
+        if self.asset_percentages is not None:
+            allowed_symbols = self.client.self_symbols().get('data')
+            if not isinstance(allowed_symbols, list):
+                raise ValueError('Permessi sulle coppie CEX non verificabili: nessun piano valido')
         for symbol in symbols:
-            rules = self.client.symbol_rules(symbol)
-            if rules.base_asset + 'USDT' != symbol or rules.quote_asset != 'USDT':
-                raise ValueError(f'Mapping {self.venue} non valido: ' + symbol)
-            commissions = _commission_payload(self.client.trade_fee(symbol))
-            actual_fee = max(number(commissions[k], f'commissione {self.venue}', positive=False)
-                             for k in ('makerCommission', 'takerCommission'))
-            if actual_fee > D(context['fee']):
-                raise ValueError(f'{symbol}: commissione {self.venue} maggiore di quella configurata; aggiornare il margine commissioni')
-            rules_by_symbol[symbol] = rules
+            try:
+                if allowed_symbols is not None and symbol not in allowed_symbols:
+                    if symbol not in required_symbols:
+                        unavailable.append(symbol[:-4])
+                        continue
+                    raise ValueError('Coppia hedge non autorizzata per la API selezionata')
+                rules = self.client.symbol_rules(symbol)
+                if rules.base_asset + 'USDT' != symbol or rules.quote_asset != 'USDT':
+                    raise ValueError(f'Mapping {self.venue} non valido: ' + symbol)
+                commissions = _commission_payload(self.client.trade_fee(symbol))
+                actual_fee = max(number(commissions[k], f'commissione {self.venue}', positive=False)
+                                 for k in ('makerCommission', 'takerCommission'))
+                if actual_fee > D(context['fee']):
+                    raise ValueError(f'{symbol}: commissione {self.venue} maggiore di quella configurata; aggiornare il margine commissioni')
+                rules_by_symbol[symbol] = rules
+            except Exception:
+                if symbol in required_symbols:
+                    raise
+                unavailable.append(symbol[:-4])
         snapshots = self._market_snapshots(rules_by_symbol, deadline, identity)
+        self._last_snapshots = snapshots
+        self._last_rules = rules_by_symbol
         self._check_market_freshness(snapshots, deadline, identity)
-        result = propose(context, snapshots, balances)
+        if self.asset_percentages is None:
+            result = propose(context, snapshots, balances)
+        else:
+            from .rebalance_portfolio import propose_selected
+            if protected_context['strategies']:
+                if full_context.get('protected_ideal'):
+                    from .rebalance_ideal import funding_targets
+                    protected, _ = funding_targets(full_context['protected_ideal'], snapshots)
+                    context['protected_ideal'] = full_context['protected_ideal']
+                else:
+                    protected, _, _ = coverage_targets(protected_context, snapshots)
+                context['protected_targets'] = {a: str(q) for a, q in protected.items()}
+            context['unavailable_sources'] = unavailable
+            result = propose_selected(context, snapshots, balances, rules_by_symbol)
         from .hedge_unwind import protect_failed_hedge_inventory
         permitted = []
-        for item in result['orders']:
+        protection_failed = False
+        for item in result.get('projected_orders', result['orders']):
             item['cex'] = self.venue
             try:
                 protect_failed_hedge_inventory(
@@ -663,12 +728,21 @@ class CexRebalanceService:
                     refunded_swap_uuids=self._refunded_swap_uuids(context),
                 )
             except ValueError as exc:
+                protection_failed = True
                 result['notes'].append(str(exc))
                 # A protected position is not surplus available for transfer.
                 result['transfers'] = [row for row in result['transfers'] if row['asset'] != item['asset']]
             else:
-                permitted.append(item)
-        result['orders'] = permitted
+                if item in result['orders']:
+                    permitted.append(item)
+        if self.asset_percentages is not None and protection_failed:
+            # A no-loss unwind protection invalidates projected conversions too.
+            result['orders'] = []
+            result['projected_orders'] = []
+            result['coverage_percent'] = None
+            result['notes'].append('Copertura non eseguibile: inventario hedge protetto. Nessun piano parziale autorizzato.')
+        else:
+            result['orders'] = permitted
         self._check_market_freshness(snapshots, deadline, identity)
         for item in result['orders']:
             item['cex'] = self.venue
@@ -681,6 +755,7 @@ class CexRebalanceService:
         path = Path(self.journal_path + '.rebalance.sqlite3')
         path.parent.mkdir(parents=True, exist_ok=True)
         db = sqlite3.connect(path)
+        path.chmod(0o600)
         db.execute('CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL, result TEXT NOT NULL)')
         db.commit()
         return db
@@ -718,6 +793,8 @@ class CexRebalanceService:
                         or result.get('side') != order['side']
                         or number(result.get('origQty'), 'quantità ordine') != D(order['quantity'])):
                     raise ValueError('Identità rebalance CEX non verificabile: conservare il blocco e aggiornare lo stato')
+                if order.get('allocation_id') and number(result.get('price'), 'prezzo ordine') != D(order['price']):
+                    raise ValueError('Prezzo rebalance CEX discordante: conservare il blocco budget')
                 state = str(result.get('status', 'UNKNOWN'))
                 filled = number(result.get('executedQty'), 'quantità eseguita', positive=False)
                 if filled > D(order['quantity']) or (state == 'FILLED' and filled != D(order['quantity'])):
@@ -746,11 +823,13 @@ class CexRebalanceService:
             full_context = self.api.get('/v1/rebalance/context')
             assert_idle(full_context, self.journal_path)
             context = self._context(full_context)
-            if fingerprint(context) != plan['fingerprint']:
+            if self.asset_percentages is None and fingerprint(context) != plan['fingerprint']:
                 raise ValueError('Strategie cambiate: ricalcolare la proposta')
             fresh = self.preview()
             item = plan['orders'][0]
-            if fresh['fingerprint'] != plan['fingerprint'] or not fresh['orders'] or item != fresh['orders'][0]:
+            if fresh['fingerprint'] != plan['fingerprint']:
+                raise ValueError('Riferimento maker, budget residuo o selezione cambiati: ricalcolare e confermare')
+            if self.asset_percentages is None and (not fresh['orders'] or item != fresh['orders'][0]):
                 raise ValueError('Prezzo, saldo o quantità cambiati: ricalcolare e confermare di nuovo')
             account = self.client.account()
             if not account.get('canTrade') or self.client.open_orders():
@@ -763,11 +842,19 @@ class CexRebalanceService:
                     or (rules.max_quote_amount is not None and D(item['notional']) > rules.max_quote_amount)):
                 raise ValueError(f'Ordine non consentito dalle regole {self.venue}')
             balances = free_balances(account, venue=self.venue)
+            if self.asset_percentages is not None:
+                from .rebalance_validation import approved_step
+                approved_step(item, fresh, self._last_snapshots, balances, {**self._last_rules,item['symbol']:rules})
             fee = D(context['fee'])
             spending_asset = 'USDT' if item['side'] == 'BUY' else item['asset']
             required = (D(item['notional']) * (1 + fee) if item['side'] == 'BUY' else D(item['quantity']) * (1 + fee))
-            if balances.get(spending_asset, {}).get('free', D(0)) < required + D(fresh['targets'].get(spending_asset, '0')):
+            if balances.get(spending_asset, {}).get('free', D(0)) < required + D(fresh['targets'].get(spending_asset, '0')) + D(fresh.get('protected_targets', {}).get(spending_asset, '0')):
                 raise ValueError('Saldo cambiato: la riserva di copertura non può essere utilizzata')
+            if self.asset_percentages is not None:
+                from .rebalance_allocation import resolve
+                envelope = resolve(self, balances)
+                if required > D(envelope['remaining'].get(spending_asset, '0')):
+                    raise ValueError('Budget selezionato insufficiente: nessun ordine inviato')
             if time.time() > plan['expires'] or time.time() > fresh['expires'] - 90:
                 raise ValueError('Verifiche troppo lente: ricalcolare la proposta')
             # Recheck after all other preflight reads and just before the

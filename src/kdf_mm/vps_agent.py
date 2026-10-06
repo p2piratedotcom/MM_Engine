@@ -71,7 +71,7 @@ WALLET_POST_PATHS = frozenset({
     "/v1/strategies/start-all", "/v1/strategies/pause-all",
     "/v1/strategies/scale", "/v1/reconciliation/run",
     "/v1/engine/shutdown", "/v1/credentials/store",
-    "/v1/rebalance/analyze", "/v1/rebalance/execute", "/v1/rebalance/status",
+    "/v1/rebalance/ideal", "/v1/rebalance/analyze", "/v1/rebalance/execute", "/v1/rebalance/status",
 })
 
 
@@ -147,6 +147,12 @@ def handler_factory(
             hmac.compare_digest(wallet_worker_token, token)):
         raise ValueError("wallet worker requires a separate private token")
 
+    # Persist one read-only display lane for all wallet balance HTTP requests.
+    from .exchanges.balances import PreviewBalances
+    from .credentials import LinuxSecretService
+    display_balances = PreviewBalances(
+        keyring_factory=lambda: LinuxSecretService(profile=cex_profile)) if wallet_mode else None
+
     class AgentHandler(BaseHTTPRequestHandler):
         server_version = "KdfMmAgent/0.1"
 
@@ -171,6 +177,8 @@ def handler_factory(
                                  "plugin_protocol": 1,
                                  "plugins_external": installed_plugins() is not None,
                                  "rebalance": wallet_rebalance is not None,
+                                 "rebalance_selection": 1 if wallet_rebalance is not None else 0,
+                                 "rebalance_ideal": wallet_rebalance is not None,
                                  "live_enabled": wallet_live_enabled})
             elif path == "/v1/exchanges/balances" and wallet_mode:
                 try:
@@ -178,8 +186,7 @@ def handler_factory(
                     from .credentials import LinuxSecretService
                     from .venues import normalize_cex
                     venue = normalize_cex(parse_qs(urlparse(self.path).query).get("venue", ["MEXC"])[0])
-                    reader = PreviewBalances(keyring_factory=lambda: LinuxSecretService(profile=cex_profile))
-                    balances = reader.read_account(venue)
+                    balances = display_balances.read_account(venue)
                     self._json(200, {"venue": venue, "read_only": True,
                         "balances": [{"ticker": key, "available": str(value)}
                                      for key, value in balances.items()]})
@@ -381,7 +388,7 @@ def handler_factory(
                 return
             from .rebalance_guard import rebalance_guard
             if (urlparse(self.path).path.startswith('/v1/wallet/send/')
-                    or urlparse(self.path).path in {'/v1/rebalance/analyze', '/v1/rebalance/execute', '/v1/rebalance/status'}):
+                    or urlparse(self.path).path in {'/v1/rebalance/ideal', '/v1/rebalance/analyze', '/v1/rebalance/execute', '/v1/rebalance/status'}):
                 # Execute takes its own EXCLUSIVE gate; status must remain
                 # reachable while an uncertain rebalance blocks publication.
                 self._post_authenticated()
@@ -408,10 +415,10 @@ def handler_factory(
             try:
                 payload = self._body()
                 path = urlparse(self.path).path
-                if path in {'/v1/rebalance/analyze', '/v1/rebalance/execute', '/v1/rebalance/status'} and wallet_mode:
+                if path in {'/v1/rebalance/ideal', '/v1/rebalance/analyze', '/v1/rebalance/execute', '/v1/rebalance/status'} and wallet_mode:
                     if wallet_rebalance is None:
                         raise ValueError('Ribilanciamento non disponibile: aggiornare il motore')
-                    method = {'/v1/rebalance/analyze': wallet_rebalance.analyze,
+                    method = {'/v1/rebalance/ideal': wallet_rebalance.ideal, '/v1/rebalance/analyze': wallet_rebalance.analyze,
                               '/v1/rebalance/execute': wallet_rebalance.execute,
                               '/v1/rebalance/status': wallet_rebalance.status}[path]
                     result = method(payload)
@@ -431,11 +438,15 @@ def handler_factory(
                             or not 1 <= len(api_secret) <= 512):
                         raise ValueError("credenziali o conferma non valide")
                     keyring = LinuxSecretService(profile=cex_profile)
+                    if display_balances is not None:
+                        display_balances.invalidate_display()
                     if wallet_rebalance is not None:
                         wallet_rebalance.store_credentials(venue,
                             lambda: keyring.store(venue, MexcCredentials(api_key, api_secret)))
                     else:
                         keyring.store(venue, MexcCredentials(api_key, api_secret))
+                    if display_balances is not None:
+                        display_balances.invalidate_display()
                     result = {"stored": venue}
                 elif path.startswith('/v1/wallet/send/'):
                     if wallet_send is None:
