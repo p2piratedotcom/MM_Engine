@@ -58,6 +58,13 @@ class PublicationRecovery:
             self.db.execute("UPDATE publication_intents SET state='HELD',detail='Recupero automatico sospeso manualmente' WHERE strategy_id=? AND state IN ('PENDING','REGISTERED')",
                             (strategy_id,))
 
+    def register_candidate(self, intent, snapshot):
+        """Idempotently restore all persisted quote terms before caller binding."""
+        uid, plan = self.candidate(intent, snapshot)
+        minimum = None if intent['minimum'] is None else Decimal(intent['minimum'])
+        self.ownership.register(uid, plan, min_volume=minimum)
+        return uid, plan
+
     def candidate(self, intent, snapshot):
         plan = decode_plan(json.loads(intent['plan']))
         before = set(json.loads(intent['before_uuids']))

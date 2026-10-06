@@ -102,6 +102,11 @@ not classified as human pauses solely from a boolean; inspect their source and
 owned-order terminal evidence. Count actual OPEN-to-terminal transitions and
 republications by UUID/timestamp, not repeated countdown messages or repricing.
 
+Bulk pause also holds disabled rows with pending publication/update intents.
+Readback restores persisted minimum volume before binding an order UUID.
+See [maker recovery invariants](MAKER_RECOVERY_INVARIANTS.md) for shared-pool
+scope and crash/pause regression fixtures.
+
 ## Feed and timeout model
 
 Depth and 24-hour metadata use separate read-only plugin readers. The bounded

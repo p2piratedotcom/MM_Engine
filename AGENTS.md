@@ -35,6 +35,9 @@ five repositories. Do not attribute SDK/GUI changes to a different KDF binary.
 | Rebalance | `src/kdf_mm/wallet_rebalance.py`, `rebalance_ideal.py`, `rebalance_portfolio.py`, `rebalance_allocation.py`, `rebalance_validation.py` |
 | Plugin host and diagnostics | `src/kdf_mm/exchange_plugin_host.py`, `src/kdf_mm/exchanges/`, `src/kdf_mm/network_diagnostics.py` |
 
+See [maker recovery invariants](docs/MAKER_RECOVERY_INVARIANTS.md); shared pool
+selection lives in `src/kdf_mm/inventory_reservations.py`.
+
 ## Engine-specific constraints
 
 - In wallet-service mode attach to the wallet's KDF/Tor only. Never start/stop them
