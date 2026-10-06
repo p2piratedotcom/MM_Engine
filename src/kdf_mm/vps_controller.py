@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .inventory_reservations import reserved_pool_volume
+
 import logging
 import threading
 import time
@@ -1170,14 +1172,9 @@ class VpsController:
         if max_maker_volume is None:
             return
         maximum = Decimal(_numeric_decimal(max_maker_volume(plan.inventory_pool), "volume"))
-        already_advertised = sum(
-            (
-                order.advertised_volume
-                for order in self.ownership.active_for_pool(plan.inventory_pool)
-                if order.order_uuid != excluding_order_uuid
-                and (not plan.strategy_id or (order.kdf_base, order.kdf_rel) == (plan.kdf_base, plan.kdf_rel))
-            ),
-            start=Decimal("0"),
+        already_advertised = reserved_pool_volume(
+            self.ownership.active_for_pool(plan.inventory_pool), plan.inventory_pool,
+            excluding=(excluding_order_uuid,),
         )
         requested_total = already_advertised + plan.kdf_volume
         if requested_total > maximum:

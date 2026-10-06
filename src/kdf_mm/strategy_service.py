@@ -11,6 +11,7 @@ from decimal import Decimal, ROUND_CEILING
 from typing import Any, Mapping
 
 from .market_data import MarketDataStore
+from .inventory_reservations import reserved_pool_volume
 from .kdf import KdfPreflightError, KdfRpcClient
 from .markets import MarketSpec
 from .models import DexSide, HedgeSide
@@ -388,8 +389,9 @@ class StrategyService:
         free = {asset: free.get(self._coverage_key(spec, asset), D(0))
                 for asset in {"USDT", spec.base.asset, spec.quote.asset}}
         maximum = D(_numeric_decimal(c.kdf.max_maker_volume(spec.sold.ticker), "volume"))
-        committed = sum((self._coverage_volume(o) for o in (*active, *extra)
-                         if (o.kdf_base, o.kdf_rel) == (spec.sold.ticker, spec.bought.ticker)), D(0))
+        committed = reserved_pool_volume(
+            (*active, *extra), spec.sold.ticker, volume_of=self._coverage_volume,
+        )
         remaining, daily = self.store.remaining(spec)
         snapshots = {r.symbol: c.market_data_by_symbol[self._key(spec, r.symbol)].current()
                      for r in (spec.base, spec.quote) if r.symbol}
@@ -636,6 +638,9 @@ class StrategyService:
             if row["state"] == "DELETED":
                 raise ValueError("strategia eliminata: creare una nuova configurazione")
             if not enabled:
+                # Operator intent applies to every publication state, including
+                # a disabled uncertain write missed by ordinary enabled flags.
+                self.controller.publications.hold(strategy_id)
                 self.controller.cancellations.hold(strategy_id)
                 if self.controller.cancellations.pending(strategy_id):
                     self.store.update(strategy_id, enabled=0, state='REVIEW_REQUIRED',
@@ -685,10 +690,12 @@ class StrategyService:
             else:
                 targets = [row["id"] for row in rows if row["enabled"]]
             if not enabled:
-                # Disabled recovering rows are deliberately absent from targets;
-                # a global stop must nevertheless revoke their resume intent.
+                # Recovery can disable a row while still owning a pending write.
+                # Bulk pause must revoke all durable mutation resume intentions.
                 targets = list(dict.fromkeys([*targets, *(row['id'] for row in rows
-                    if self.controller.cancellations.pending(row['id']))]))
+                    if (self.controller.cancellations.pending(row['id'])
+                        or self.controller.publications.pending(row['id'])
+                        or self.store.update_intent(row['id'])))]))
             changed, errors = [], []
             for strategy_id in targets:
                 try:
@@ -1026,8 +1033,7 @@ class StrategyService:
         self._recovery_checked[spec.strategy_id] = now
         try:
             snapshot = self.controller.kdf._maker_order_snapshot(timeout=2.0)
-            uid, plan = journal.candidate(intent, snapshot)
-            self.controller.ownership.register(uid, plan)
+            uid, plan = journal.register_candidate(intent, snapshot)
             self.store.bind_order(spec.strategy_id, uid)
             self.controller.ownership.bind_strategy(uid, spec.strategy_id)
             self.controller.ownership.record_order_event(uid, 'PUBLICATION_RECOVERED',
