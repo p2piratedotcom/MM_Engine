@@ -22,16 +22,46 @@ Budgets expire after 24 hours; individual proposals expire after 120 seconds.
 Changing a selection supersedes prior budgets/proposals on that venue.
 Changing API credentials invalidates stored proposals and allocation budgets.
 
-The engine advertises `rebalance_selection: 1`. Legacy engine/TUI rebalance
+The engine advertises `rebalance_selection: 1` and `rebalance_ideal: true`. Legacy engine/TUI rebalance
 requests keep their previous policy. GUI selection controls require the new
 capability; arbitrary prices, quantities and caps from the GUI are never used.
 
+## Three-stage preview
+
+1. `/v1/rebalance/ideal` reads local maker configurations, remaining/daily
+   budgets and persisted confirmed maker prices only. It makes no CEX or KDF
+   network request. Fixed quantities and explicit auto maxima are bounded by
+   the remaining/daily budget. Replenishing auto makers without a maximum use
+   the finite nominal initial maker budget as their funding reference, multiplied
+   by the configured auto fraction. Current OPEN obligations remain a floor.
+   This is a funding goal, not a claim that the wallet can publish that quantity.
+   Missing local reference prices fail explicitly instead of inventing rates.
+2. Analyze values those native hedge obligations at fresh CEX prices and adds
+   fees plus 20% reserve. It shows actual free Spot holdings, reserves for other
+   makers, full ideal requirements and deficits. Locked funds are excluded.
+   Local USDT equivalents are indicative; current buy prices set the live value.
+3. The preview shows current financial coverage and the common attainable
+   financial fraction, clearly FULL or PARTIAL, with the conversion sequence.
+   Hedge minimum, shared depth and 24h-volume limits are reported separately:
+   enough funds does not imply enough liquidity or authorize publication.
+
+The native reference is stored with the spending allocation. Repeated Analyze
+after confirmed fills revalues the same quantities instead of moving the goal
+with each order-book update. Changed maker settings/budgets/enablement refresh
+the reference; increased OPEN obligations cannot be hidden by a cached ideal.
+Existing allocations migrate without resetting their caps or fill accounting.
+
+Funding sources and hedge destinations are distinct. An asset with zero Spot
+balance can still be bought if the selected makers need it and authorized USDT
+can fund it. For a wallet maker selling DASH for USDT, the eventual hedge is a
+BUY of DASH: pre-fund USDT, not DASH. For a maker selling USDT for DASH, the
+hedge sells DASH: rebalance may first acquire DASH even from zero inventory.
+
 ## Calculation
 
-1. Compute each selected maker's current hedge requirements from its actual
-   published quantity, or its finite spendable KDF amount and strategy limits.
-   Add hedge fees and the existing 20% reserve. Do not substitute unlimited KDF
-   funds, overcount replacements or bypass per-pair depth/daily limits.
+1. Keep the local native maker reference independent of CEX funds and depth.
+   Value its hedge requirements at fresh prices, adding hedge fees and the
+   existing 20% reserve. Do not shrink the ideal because it is not fully funded.
 2. Initial source debit cap is `fresh_free_balance * percentage / 100`.
    Non-selected assets have zero debit authorization. USDT received from a
    confirmed rebalance sale becomes additional authorized USDT, never from an
@@ -43,8 +73,9 @@ capability; arbitrary prices, quantities and caps from the GUI are never used.
    more than the remaining source envelope.
 4. For BUY, acquire deficits after conservative receipt fees. For SELL, cap
    quantity by remaining source budget and surplus, both divided by `1+fee`.
-   Price limits use the existing 1% impact bound; depth is at most half the
-   visible executable depth within that bound. Apply price/quantity steps,
+   Preview limits use a 0.5% margin, leaving room within the existing 1%
+   execution impact bound. Depth is at most half the visible executable depth
+   within the actual approved limit. Apply price/quantity steps,
    minimum notional, venue maximum notional, supported sides and LIMIT type.
    Tiny purchases may round up to a minimum lot only if actually affordable.
 5. A monotone 64-step Decimal bisection maximizes the common fraction. It is a
@@ -85,17 +116,31 @@ All old uncertain-send/publication/hedge locks remain in force.
 - At most 24 selected funding assets and 16 required market snapshots per
   analysis. Public reads remain bounded with original book/volume observation
   times (10/15 seconds) and a 30-second read window. Slow analyses fail closed.
-- Selected fixed makers outside current hedge minima/depth, and auto makers
-  unable to meet KDF/market hedge minima, block the plan
-  with their reason; exhausted/zero targets do not pretend to be 100% covered.
+- Maker hedge minima/depth/volume limits are separate diagnostics, not a reason
+  to silently delete that maker from the ideal. Funding can be prepared while
+  liquidity is inadequate; live publication still enforces its own checks.
+  Exhausted/zero references do not pretend to be 100% covered.
 - A protected failed-hedge inventory invalidates executable and projected
   conversions; no misleading partial-plan coverage is approved.
 - Missing balances, deleted maker selections, expired budgets, credential
-  replacement and changed market/strategy/account data require correction and
-  reanalysis. No automatic order replay, transfer, withdrawal or maker resume.
+  replacement and material strategy/account/market changes require correction
+  and reanalysis. No automatic order replay, transfer, withdrawal or maker resume.
 - The ordinary balance list is display-only and may be stale; analysis always
   loads current account funds, rules, permissions and fees. Live execution has
-  not been validated with funded trades in this implementation.
+  not been exercised with funded trades by the agent. User-reported fills do
+  not verify all execution/recovery scenarios.
+
+## Approved-step execution
+
+Selected-wallet execution no longer requires byte-for-byte equality with a
+new optimizer suggestion. It retains the exact user-approved LIMIT quantity
+and price, then validates current permissions, steps/minimum/maximum notional,
+crossing price within 1%, at most half executable depth, usefulness relative
+to the remaining ideal deficit, real balances, protected inventory, remaining
+debit authorization, freshness and all existing idle/uncertain-intent checks.
+It never replaces the approved price or quantity. Excessive, unnecessary,
+unfunded, stale or unexecutable trades fail before a durable order is submitted
+with a specific reason. Legacy TUI proposals keep their previous comparison.
 
 Venue constraints are grounded in the adapter's normalized rules and current
 responses; see [MEXC Spot API](https://www.mexc.io/api-docs/spot-v3/introduction)

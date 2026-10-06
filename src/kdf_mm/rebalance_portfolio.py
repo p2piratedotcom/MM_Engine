@@ -11,14 +11,14 @@ from .rebalance import coverage_targets, fingerprint, number
 
 def propose_selected(context, snapshots, balances, rules):
     notes, excluded, sizing = [], [], []
-    targets, kdf, _ = coverage_targets(context, snapshots, warnings=notes, excluded=excluded, sizing=sizing)
-    if notes:
-        raise ValueError('Ordine fisso incompatibile con i minimi o la liquidità hedge attuale: ' + '; '.join(notes))
-    if excluded:
-        raise ValueError('Uno o più maker selezionati non sono copribili per limiti KDF/mercato: '
-                         + '; '.join(item['reason'] for item in excluded))
-    if not targets:
-        raise ValueError('Nessun target hedge disponibile: verificare budget residui e limiti giornalieri dei maker')
+    if context.get('ideal'):
+        from .rebalance_ideal import funding_targets
+        targets,sizing = funding_targets(context['ideal'],snapshots)
+        kdf = {}
+    else:
+        targets,kdf,_ = coverage_targets(context,snapshots,warnings=notes,excluded=excluded,sizing=sizing)
+        if notes or excluded: raise ValueError('Maker non copribile con il riferimento corrente')
+    if not targets: raise ValueError('Nessun target hedge disponibile')
     protected = {a: D(q) for a, q in context.get('protected_targets', {}).items()}
     available = {a: max(D(0), b['free'] - protected.get(a, D(0))) for a, b in balances.items()}
     budget = {a: D(q) for a, q in context['allocation']['remaining'].items()}
@@ -37,7 +37,10 @@ def propose_selected(context, snapshots, balances, rules):
         if rule is None or snap is None or not rule.allows(HedgeSide(side)) or 'LIMIT' not in rule.order_types:
             return None
         levels = snap.order_book().asks if side == 'BUY' else snap.order_book().bids
-        price = levels[0].price * (D('1.01') if side == 'BUY' else D('.99'))
+        # Quote inside the 1% execution boundary. Placing the preview at the
+        # boundary itself leaves no room for even a favorable one-tick move.
+        # The displayed limit remains immutable after user confirmation.
+        price = levels[0].price * (D('1.005') if side == 'BUY' else D('.995'))
         price = (price / snap.price_step).to_integral_value(
             rounding=ROUND_FLOOR if side == 'BUY' else ROUND_CEILING) * snap.price_step
         if price <= 0:
@@ -131,8 +134,10 @@ def propose_selected(context, snapshots, balances, rules):
             if debit <= cash:
                 ready.append(item)
                 cash -= debit
+    from .rebalance_ideal import hedge_limits
+    hedge_capacity = hedge_limits(context,snapshots,rules)
     pct = fraction * 100
-    notes.append(f'Copertura comune massima stimata: {pct:.2f}% dei target selezionati, inclusa riserva del 20%. '
+    notes.append(f'Copertura finanziaria comune massima stimata: {pct:.2f}% dei target selezionati, inclusa riserva del 20%. '
                  'Non modifica quantità o stato dei maker; non autorizza maker sotto i minimi hedge.')
     if fraction < 1:
         notes.append('Copertura completa non raggiungibile con questi budget, fondi protetti, minimi e profondità. '
@@ -140,13 +145,18 @@ def propose_selected(context, snapshots, balances, rules):
     for item in sizing:
         notes.append(f"Maker #{item['number']} {item['sell']} → {item['buy']}: target su {item['quantity']} {item['sell']} ({item['basis']}).")
     return {'targets': {a: str(q) for a, q in covered.items()},
-            'full_targets': {a: str(q) for a, q in targets.items()},
+            'full_targets': {a: str(q) for a, q in targets.items()}, 'ideal': context.get('ideal'),
             'kdf_targets': {a: str(q) for a, q in kdf.items()},
+            'current_coverage_percent':str((min([D(1)]+[available.get(a,D(0))/q for a,q in targets.items() if q>0])*100).quantize(D('.01'),rounding=ROUND_FLOOR)),
             'coverage_percent': str(pct.quantize(D('.01'), rounding=ROUND_FLOOR)), 'allocation': context['allocation'],
             'funding': {a: {'required': str(covered[a]), 'full_required': str(q),
                            'available': str(available.get(a, D(0))),
-                           'missing': str(max(D(0), covered[a] - available.get(a, D(0))))} for a, q in targets.items()},
+                           'spot_free':str(balances.get(a,{}).get('free',D(0))),
+                           'spot_locked':str(balances.get(a,{}).get('locked',D(0))),
+                           'missing': str(max(D(0), covered[a] - available.get(a, D(0)))),
+                           'ideal_missing': str(max(D(0), q - available.get(a,D(0)))),
+                           'projected': str(max(available.get(a,D(0)),covered[a]))} for a, q in targets.items()},
             'protected_targets': {a: str(q) for a, q in protected.items()},
             'projected_orders': sales + buys, 'orders': ready, 'transfers': [],
-            'notes': notes, 'strategy_actions': excluded, 'sizing': sizing,
+            'notes': notes, 'strategy_actions': excluded, 'sizing': sizing, 'hedge_capacity':hedge_capacity,
             'fingerprint': fingerprint(context)}

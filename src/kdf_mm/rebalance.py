@@ -84,8 +84,8 @@ def fingerprint(context):
              'daily_remaining': r.get('daily_remaining_sold'), 'enabled': r['enabled'],
              'state': r['state']} for r in context['strategies']]
     return hashlib.sha256(json.dumps({'rows': rows, 'open_quotes': context.get('open_quotes', []),
-        'wallet': context.get('wallet', {}),
-        'allocation': context.get('allocation'), 'protected_targets': context.get('protected_targets', {}),
+        'wallet': {} if context.get('ideal') else context.get('wallet', {}),
+        'allocation': context.get('allocation'), 'ideal': context.get('ideal'), 'protected_targets': context.get('protected_targets', {}),
         'fee': context['fee'], 'buffer': context['buffer'],
         'daily_fraction': context['daily_fraction']}, sort_keys=True).encode()).hexdigest()
 
@@ -445,13 +445,14 @@ def _commission_payload(payload):
 class CexRebalanceService:
     def __init__(self, api, settings, journal_path, *, venue='MEXC', profile='default', client=None,
                  strategy_ids=None, public_client_factory=None,
-                 asset_percentages=None, allocation_id=None):
+                 asset_percentages=None, allocation_id=None, ideal=None):
         from .venues import normalize_cex
         self.api, self.settings, self.journal_path = api, settings, str(Path(journal_path).resolve())
         self.venue, self.profile, self._client = normalize_cex(venue), profile, client
         self.strategy_ids = None if strategy_ids is None else frozenset(strategy_ids)
         self.asset_percentages = asset_percentages
         self.allocation_id = allocation_id
+        self.ideal = ideal
         # Injected clients remain caller-owned and sequential. Production uses
         # independent public-only readers, never parallel signing clients.
         self._public_client_factory = public_client_factory
@@ -635,12 +636,21 @@ class CexRebalanceService:
         if full_context['repricing'].get('quotes'):
             raise ValueError('Sono presenti quotazioni legacy: rimuoverle o convertirle in strategie prima del rebalance')
         context = self._context(full_context)
+        if self.ideal is not None:
+            from .rebalance_ideal import covers_open, maker_key
+            if self.ideal['maker_key']!=maker_key(context['strategies']):
+                raise ValueError('Configurazione o budget maker cambiato: ricalcolare la copertura ideale')
+            if number(self.ideal['fee'],'commissione del riferimento',positive=False)!=D(context['fee']):
+                raise ValueError('Commissione configurata cambiata: ricalcolare la copertura ideale')
+            if not covers_open(self.ideal,context.get('open_quotes',[])):
+                raise ValueError('Obblighi degli ordini aperti aumentati: ricalcolare la copertura ideale')
         started = time.time()
         deadline, identity = time.monotonic() + 30, uuid.uuid4().hex
         balances = free_balances(self.client.account(), venue=self.venue)
         if self.asset_percentages is not None:
             from .rebalance_allocation import resolve
             context['allocation'] = resolve(self, balances)
+            context['ideal'] = self.ideal
             # Preserve liabilities of non-selected active/open makers too.
             venue_context = _venue_context(full_context, self.venue, self.configured_fee)
             opened = {q['strategy_id'] for q in venue_context['open_quotes']}
@@ -687,13 +697,20 @@ class CexRebalanceService:
                     raise
                 unavailable.append(symbol[:-4])
         snapshots = self._market_snapshots(rules_by_symbol, deadline, identity)
+        self._last_snapshots = snapshots
+        self._last_rules = rules_by_symbol
         self._check_market_freshness(snapshots, deadline, identity)
         if self.asset_percentages is None:
             result = propose(context, snapshots, balances)
         else:
             from .rebalance_portfolio import propose_selected
             if protected_context['strategies']:
-                protected, _, _ = coverage_targets(protected_context, snapshots)
+                if full_context.get('protected_ideal'):
+                    from .rebalance_ideal import funding_targets
+                    protected, _ = funding_targets(full_context['protected_ideal'], snapshots)
+                    context['protected_ideal'] = full_context['protected_ideal']
+                else:
+                    protected, _, _ = coverage_targets(protected_context, snapshots)
                 context['protected_targets'] = {a: str(q) for a, q in protected.items()}
             context['unavailable_sources'] = unavailable
             result = propose_selected(context, snapshots, balances, rules_by_symbol)
@@ -810,7 +827,9 @@ class CexRebalanceService:
                 raise ValueError('Strategie cambiate: ricalcolare la proposta')
             fresh = self.preview()
             item = plan['orders'][0]
-            if fresh['fingerprint'] != plan['fingerprint'] or not fresh['orders'] or item != fresh['orders'][0]:
+            if fresh['fingerprint'] != plan['fingerprint']:
+                raise ValueError('Riferimento maker, budget residuo o selezione cambiati: ricalcolare e confermare')
+            if self.asset_percentages is None and (not fresh['orders'] or item != fresh['orders'][0]):
                 raise ValueError('Prezzo, saldo o quantità cambiati: ricalcolare e confermare di nuovo')
             account = self.client.account()
             if not account.get('canTrade') or self.client.open_orders():
@@ -823,6 +842,9 @@ class CexRebalanceService:
                     or (rules.max_quote_amount is not None and D(item['notional']) > rules.max_quote_amount)):
                 raise ValueError(f'Ordine non consentito dalle regole {self.venue}')
             balances = free_balances(account, venue=self.venue)
+            if self.asset_percentages is not None:
+                from .rebalance_validation import approved_step
+                approved_step(item, fresh, self._last_snapshots, balances, {**self._last_rules,item['symbol']:rules})
             fee = D(context['fee'])
             spending_asset = 'USDT' if item['side'] == 'BUY' else item['asset']
             required = (D(item['notional']) * (1 + fee) if item['side'] == 'BUY' else D(item['quantity']) * (1 + fee))

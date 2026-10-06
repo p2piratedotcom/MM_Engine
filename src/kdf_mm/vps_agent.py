@@ -71,7 +71,7 @@ WALLET_POST_PATHS = frozenset({
     "/v1/strategies/start-all", "/v1/strategies/pause-all",
     "/v1/strategies/scale", "/v1/reconciliation/run",
     "/v1/engine/shutdown", "/v1/credentials/store",
-    "/v1/rebalance/analyze", "/v1/rebalance/execute", "/v1/rebalance/status",
+    "/v1/rebalance/ideal", "/v1/rebalance/analyze", "/v1/rebalance/execute", "/v1/rebalance/status",
 })
 
 
@@ -178,6 +178,7 @@ def handler_factory(
                                  "plugins_external": installed_plugins() is not None,
                                  "rebalance": wallet_rebalance is not None,
                                  "rebalance_selection": 1 if wallet_rebalance is not None else 0,
+                                 "rebalance_ideal": wallet_rebalance is not None,
                                  "live_enabled": wallet_live_enabled})
             elif path == "/v1/exchanges/balances" and wallet_mode:
                 try:
@@ -387,7 +388,7 @@ def handler_factory(
                 return
             from .rebalance_guard import rebalance_guard
             if (urlparse(self.path).path.startswith('/v1/wallet/send/')
-                    or urlparse(self.path).path in {'/v1/rebalance/analyze', '/v1/rebalance/execute', '/v1/rebalance/status'}):
+                    or urlparse(self.path).path in {'/v1/rebalance/ideal', '/v1/rebalance/analyze', '/v1/rebalance/execute', '/v1/rebalance/status'}):
                 # Execute takes its own EXCLUSIVE gate; status must remain
                 # reachable while an uncertain rebalance blocks publication.
                 self._post_authenticated()
@@ -414,10 +415,10 @@ def handler_factory(
             try:
                 payload = self._body()
                 path = urlparse(self.path).path
-                if path in {'/v1/rebalance/analyze', '/v1/rebalance/execute', '/v1/rebalance/status'} and wallet_mode:
+                if path in {'/v1/rebalance/ideal', '/v1/rebalance/analyze', '/v1/rebalance/execute', '/v1/rebalance/status'} and wallet_mode:
                     if wallet_rebalance is None:
                         raise ValueError('Ribilanciamento non disponibile: aggiornare il motore')
-                    method = {'/v1/rebalance/analyze': wallet_rebalance.analyze,
+                    method = {'/v1/rebalance/ideal': wallet_rebalance.ideal, '/v1/rebalance/analyze': wallet_rebalance.analyze,
                               '/v1/rebalance/execute': wallet_rebalance.execute,
                               '/v1/rebalance/status': wallet_rebalance.status}[path]
                     result = method(payload)

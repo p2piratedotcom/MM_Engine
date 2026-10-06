@@ -5,6 +5,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import replace
+from decimal import Decimal as D
 
 from .rebalance import CexRebalanceService, agent_context, assert_idle
 from .rebalance_guard import assert_no_pending
@@ -35,6 +36,7 @@ class WalletRebalance:
         self.journal = str(settings.desktop_journal_db)
         self._lock = threading.Lock()
         self._plans = {}
+        self._ideals = {}
         self._api = _LocalContext(self._context)
 
     @contextmanager
@@ -65,14 +67,73 @@ class WalletRebalance:
                     'price': str(order.kdf_price)})
             return result
 
-    def _service(self, venue, ids=None, *, execution=False, asset_percentages=None, allocation_id=None):
+    def _local_ideal(self, venue, ids, allocation_id=None):
+        from .rebalance_ideal import build_ideal, covers_open, maker_key
+        from .rebalance_allocation import stored_ideal
+        with self.strategies.lock, self.controller._order_lock:
+            rows = [r for r in self.strategies.status()['strategies']
+                    if r['id'] in ids and r['spec']['cex']==venue and r['state']!='DELETED']
+            if {r['id'] for r in rows} != set(ids):
+                raise ValueError('Selezione maker non più valida')
+            service = self._service(venue, ids)
+            saved = stored_ideal(service, allocation_id) if allocation_id else None
+            quotes = {}
+            owned = self.controller.ownership
+            with owned._lock:
+                recent = owned.connection.execute("SELECT strategy_id,order_uuid,kdf_base,kdf_rel,kdf_price,kdf_volume,kdf_max_volume,status,updated_at FROM owned_orders ORDER BY (status='OPEN') DESC,created_at DESC").fetchall()
+            for q in recent:
+                sid = q['strategy_id']
+                if q['status']=='OPEN' and sid in quotes and quotes[sid]['basis']=='open_maker':
+                    raise ValueError('Più ordini OPEN per lo stesso maker: verificare la riconciliazione prima del rebalance')
+                if sid in quotes or sid not in ids: continue
+                spec = StrategySpec.from_payload(next(r['spec'] for r in rows if r['id']==sid))
+                if (q['kdf_base'],q['kdf_rel'])!=(spec.sold.ticker,spec.bought.ticker): continue
+                order = owned.get(q['order_uuid'])
+                volume = self.strategies._coverage_volume(order) if q['status']=='OPEN' else order.advertised_volume
+                if volume <= 0: continue
+                quotes[sid] = {'volume':str(volume),'price':q['kdf_price'],
+                    'basis':'open_maker' if q['status']=='OPEN' else 'last_confirmed_maker',
+                    'observed_at':q['updated_at']}
+            opened = [{'strategy_id':sid,**quote} for sid,quote in quotes.items() if quote['basis']=='open_maker']
+            if (saved and saved['maker_key']==maker_key(rows) and D(saved['fee'])==service.configured_fee
+                    and covers_open(saved,opened)):
+                return saved
+            return build_ideal(rows, quotes, service.configured_fee)
+
+    def ideal(self, payload):
+        with self._operation():
+            from .venues import normalize_cex
+            import uuid
+            venue = normalize_cex(payload.get('venue'))
+            ids = payload.get('strategy_ids')
+            if not isinstance(ids,list) or not 1 <= len(ids) <= 200 or any(not isinstance(s,str) for s in ids) or len(set(ids))!=len(ids):
+                raise ValueError('Selezionare esplicitamente uno o più maker')
+            value = self._local_ideal(venue, set(ids), payload.get('allocation_id'))
+            now = time.time()
+            self._ideals = {k:v for k,v in self._ideals.items() if now-v[2]<120}
+            if len(self._ideals)>=8: self._ideals.pop(next(iter(self._ideals)))
+            identity = uuid.uuid4().hex
+            self._ideals[identity] = (venue,value,now)
+            return {**value,'ideal_id':identity}
+
+    def _service(self, venue, ids=None, *, execution=False, asset_percentages=None, allocation_id=None, ideal=None):
         # Analysis/status share the read-only credential lane, leaving the
         # live hedge client's pool free. Execution runs under the exclusive
         # gate, where operational worker cycles cannot overlap it.
         settings = self.settings if execution else replace(self.settings, live_trading=False)
-        return CexRebalanceService(self._api, settings, self.journal,
+        api = self._api
+        if ideal is not None:
+            def read():
+                context = self._context(include_wallet=False)
+                opened = {q['strategy_id'] for q in context['open_quotes'] if q['cex']==venue}
+                others = {r['id'] for r in context['strategies'] if r['spec']['cex']==venue
+                    and r['state']!='DELETED' and r['id'] not in ids and (r['enabled'] or r['id'] in opened)}
+                context['protected_ideal'] = self._local_ideal(venue,others) if others else None
+                return context
+            api = _LocalContext(read)
+        return CexRebalanceService(api, settings, self.journal,
             venue=venue, profile=self.profile, strategy_ids=ids,
-            asset_percentages=asset_percentages, allocation_id=allocation_id)
+            asset_percentages=asset_percentages, allocation_id=allocation_id, ideal=ideal)
 
     def store_credentials(self, venue, store):
         # A proposal belongs to the account whose balance was analyzed.
@@ -80,6 +141,7 @@ class WalletRebalance:
         with self._operation():
             self._plans = {pid: value for pid, value in self._plans.items()
                            if value[0]['cex'] != venue}
+            self._ideals = {key:value for key,value in self._ideals.items() if value[0]!=venue}
             from .rebalance_allocation import invalidate
             invalidate(self._service(venue))
             store()
@@ -129,7 +191,19 @@ class WalletRebalance:
                 raise ValueError('Percentuali del budget CEX mancanti')
             if policy is not None and allocation_id is None:
                 self._plans = {key: value for key, value in self._plans.items() if value[0]['cex'] != venue}
-            service = self._service(venue, ids, asset_percentages=policy, allocation_id=allocation_id)
+            ideal = None
+            if policy is not None:
+                from .rebalance_ideal import covers_open, maker_key
+                ideal_id = payload.get('ideal_id')
+                if ideal_id is not None and not isinstance(ideal_id,str):
+                    raise ValueError('Riferimento ideale non valido')
+                entry = self._ideals.get(ideal_id)
+                ideal = entry[1] if entry and entry[0]==venue and time.time()-entry[2]<120 else self._local_ideal(venue, ids, allocation_id)
+                if {r['strategy_id'] for r in ideal['makers']} - ids or ideal['maker_key']!=maker_key([candidates[sid] for sid in sorted(ids)]):
+                    raise ValueError('Riferimento maker cambiato: ricalcolare la copertura ideale')
+                if not covers_open(ideal,[q for q in context['open_quotes'] if q['strategy_id'] in ids]):
+                    raise ValueError('Quantità pubblicate aumentate: ricalcolare la copertura ideale')
+            service = self._service(venue, ids, asset_percentages=policy, allocation_id=allocation_id, ideal=ideal)
             plan = service.preview()
             plan['strategy_ids'] = sorted(ids)
             plan['maker_orders'] = []
@@ -165,7 +239,7 @@ class WalletRebalance:
             allocation = plan.get('allocation')
             service = self._service(venue, ids, execution=True,
                 asset_percentages=allocation['percentages'] if allocation else None,
-                allocation_id=allocation['id'] if allocation else None)
+                allocation_id=allocation['id'] if allocation else None, ideal=plan.get('ideal'))
             message = service.execute_first(plan)
             return {'message': message, 'orders': self._history(service), 'reanalyze_required': True}
 

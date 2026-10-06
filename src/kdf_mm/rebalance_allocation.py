@@ -27,7 +27,20 @@ def schema(db):
     db.execute('CREATE TABLE IF NOT EXISTS allocations '
                '(id TEXT PRIMARY KEY,venue TEXT NOT NULL,scope TEXT NOT NULL,'
                'percentages TEXT NOT NULL,caps TEXT NOT NULL,created REAL NOT NULL,state TEXT NOT NULL)')
+    if 'ideal' not in {r[1] for r in db.execute('PRAGMA table_info(allocations)')}:
+        db.execute('ALTER TABLE allocations ADD COLUMN ideal TEXT')
     db.commit()
+
+
+def stored_ideal(service, identity):
+    db = service._db()
+    try:
+        schema(db)
+        row = db.execute("SELECT ideal,scope,venue,state,created FROM allocations WHERE id=?",(identity,)).fetchone()
+        if not row or row[2]!=service.venue or row[3]!='ACTIVE' or time.time()-row[4]>86400 or set(json.loads(row[1]))!=set(service.strategy_ids):
+            raise ValueError('Budget non valido: aggiornare la selezione')
+        return json.loads(row[0]) if row[0] else None
+    finally: db.close()
 
 
 def resolve(service, balances):
@@ -47,17 +60,20 @@ def resolve(service, balances):
             # Pending order intents remain independently blocking and auditable.
             db.execute("UPDATE allocations SET state='SUPERSEDED' WHERE venue=? AND state='ACTIVE'",
                        (service.venue,))
-            db.execute('INSERT INTO allocations VALUES (?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO allocations(id,venue,scope,percentages,caps,created,state,ideal) VALUES (?,?,?,?,?,?,?,?)',
                        (identity, service.venue, json.dumps(scope), json.dumps(policy),
-                        json.dumps(caps), time.time(), 'ACTIVE'))
+                        json.dumps(caps), time.time(), 'ACTIVE', json.dumps(service.ideal) if service.ideal else None))
             db.commit()
             service.allocation_id = identity
-        row = db.execute('SELECT venue,scope,percentages,caps,created,state FROM allocations WHERE id=?',
+        row = db.execute('SELECT venue,scope,percentages,caps,created,state,ideal FROM allocations WHERE id=?',
                          (identity,)).fetchone()
         if (not row or row[0] != service.venue or json.loads(row[1]) != scope
                 or json.loads(row[2]) != policy or row[5] != 'ACTIVE'
                 or time.time() - row[4] > 86400):
             raise ValueError('Budget CEX scaduto o selezione cambiata: selezionare di nuovo e analizzare')
+        if service.ideal is not None and (not row[6] or json.loads(row[6])!=service.ideal):
+            db.execute('UPDATE allocations SET ideal=? WHERE id=?',(json.dumps(service.ideal),identity))
+            db.commit()
         caps = {a: number(q, 'budget coin', positive=False) for a, q in json.loads(row[3]).items()}
         remaining = dict(caps)
         # Pending rows reserve their worst-case debit. Only identity-checked
