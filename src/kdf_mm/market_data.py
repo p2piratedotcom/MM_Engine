@@ -69,6 +69,7 @@ class MarketSnapshot:
     min_quote_amount: Decimal
     signature: str
     volume_observed_at_ms: int | None = None
+    volume_known: bool = True
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "MarketSnapshot":
@@ -87,7 +88,8 @@ class MarketSnapshot:
                 min_quote_amount=Decimal(str(payload["min_quote_amount"])),
                 signature=str(payload["signature"]),
                 volume_observed_at_ms=(int(payload['volume_observed_at_ms'])
-                                       if 'volume_observed_at_ms' in payload else None),
+                                       if payload.get('volume_observed_at_ms') is not None else None),
+                volume_known=payload.get('volume_known',True),
             )
         except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
             raise MarketDataError("invalid market snapshot") from exc
@@ -95,6 +97,8 @@ class MarketSnapshot:
         return snapshot
 
     def _validate(self) -> None:
+        if type(self.volume_known) is not bool:
+            raise MarketDataError("volume_known must be boolean")
         if self.sequence < 0 or self.observed_at_ms <= 0:
             raise MarketDataError("snapshot sequence and time must be positive")
         if self.volume_observed_at_ms is not None and self.volume_observed_at_ms <= 0:
@@ -172,7 +176,8 @@ class MarketDataStore:
         if snapshot.observed_at_ms > now + self.max_future_skew_ms:
             self._diagnostic_rejection(snapshot, now, 'book_future', 'ingest')
             raise MarketDataError("market snapshot is too far in the future")
-        self._check_volume_age(snapshot, now, source="ingest")
+        if not getattr(self,"price_reference_only",False):
+            self._check_volume_age(snapshot, now, source="ingest")
         if now - snapshot.observed_at_ms > self.max_age_ms:
             self._diagnostic_rejection(snapshot, now, "book_expired", "ingest")
             raise StaleMarketData("market snapshot arrived already stale")
@@ -182,13 +187,17 @@ class MarketDataStore:
             self._current = snapshot
         return snapshot
 
-    def current(self) -> MarketSnapshot:
+    def current(self, *, price_only=False) -> MarketSnapshot:
         with self._lock:
             current = self._current
         if current is None:
             raise StaleMarketData("no market snapshot is available")
         now = self.clock_ms()
-        self._check_volume_age(current, now)
+        if current.observed_at_ms > now+self.max_future_skew_ms:
+            self._diagnostic_rejection(current,now,"book_future","current")
+            raise StaleMarketData("Market book is future-dated")
+        if not price_only:
+            self._check_volume_age(current, now)
         if now - current.observed_at_ms > self.max_age_ms:
             self._diagnostic_rejection(current, now, "book_expired", "current")
             raise StaleMarketData("market snapshot has expired")
@@ -204,6 +213,9 @@ class MarketDataStore:
                    book_max_age_ms=self.max_age_ms, volume_max_age_ms=15000)
 
     def _check_volume_age(self, snapshot, now, source='current'):
+        if not snapshot.volume_known:
+            self._diagnostic_rejection(snapshot,now,"volume_missing",source)
+            raise StaleMarketData("Rolling volume is unavailable; only price reference is usable")
         observed = snapshot.volume_observed_at_ms
         if observed is not None and (observed > now + self.max_future_skew_ms
                                       or now - observed >= 15000):

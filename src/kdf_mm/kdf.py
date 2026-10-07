@@ -13,6 +13,7 @@ from typing import Any, Mapping
 
 from .http import JsonTransport, TransportError, UrllibJsonTransport
 from .network_diagnostics import emit as diagnostic
+from .http_diagnostics import diagnostic_capture
 from uuid import uuid4
 
 
@@ -385,14 +386,16 @@ class KdfRpcClient:
         diagnostic('kdf_request_start', request_id=request_id, method=method,
                    started_at_ms=started_at_ms, timeout_ms=round(effective_timeout*1000),
                    mutating=mutation, route='local_kdf')
+        transport_records = []
         try:
-            response = self.transport.request(
-                method="POST",
-                url=self.rpc_url,
-                headers={"Content-Type": "application/json"},
-                body=body,
-                timeout=effective_timeout,
-            )
+            with diagnostic_capture() as transport_records:
+                response = self.transport.request(
+                    method="POST",
+                    url=self.rpc_url,
+                    headers={"Content-Type": "application/json"},
+                    body=body,
+                    timeout=effective_timeout,
+                )
         except TransportError as exc:
             outcome = 'transport_error'
             failure_kind, phase, http_status = exc.kind, exc.phase, exc.status
@@ -411,6 +414,9 @@ class KdfRpcClient:
             if outcome == 'received':
                 response_outcome = ('invalid_response' if not isinstance(response, Mapping) else
                                     'rpc_error' if response.get('error') is not None else 'received')
+            for index, transport in enumerate(transport_records, 1):
+                diagnostic('http_request_end', request_id=request_id, method=method,
+                           route='local_kdf', http_sequence=index, **transport)
             diagnostic('kdf_request_end', request_id=request_id, method=method,
                        started_at_ms=started_at_ms, elapsed_ms=elapsed_ms,
                        wall_elapsed_ms=time.time_ns()//1_000_000-started_at_ms,

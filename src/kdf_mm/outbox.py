@@ -151,6 +151,9 @@ class HedgeEventOutbox:
         if swap.order_uuid != order.order_uuid or swap.swap_uuid != str(status.get("uuid")):
             raise OutboxConflict("KDF swap identity does not match the owned record")
 
+        if not getattr(order,"hedging_enabled",True):
+            return None  # Validated UUID policy authorizes no CEX event/trade.
+
         quote_ticker = (
             order.kdf_rel
             if order.dex_side is DexSide.SELL_ARRR

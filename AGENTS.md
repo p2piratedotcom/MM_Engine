@@ -33,7 +33,11 @@ five repositories. Do not attribute SDK/GUI changes to a different KDF binary.
 | Ownership and uncertain writes | `src/kdf_mm/ownership.py`, `publication_recovery.py`, `cancellation_recovery.py` |
 | Market/coverage/hedging | `src/kdf_mm/public_feed.py`, `market_data.py`, `coverage.py`, `local_worker.py`, `hedging.py` |
 | Rebalance | `src/kdf_mm/wallet_rebalance.py`, `rebalance_ideal.py`, `rebalance_portfolio.py`, `rebalance_allocation.py`, `rebalance_validation.py` |
-| Plugin host and diagnostics | `src/kdf_mm/exchange_plugin_host.py`, `src/kdf_mm/exchanges/`, `src/kdf_mm/network_diagnostics.py` |
+| Plugin host and diagnostics | `src/kdf_mm/exchange_plugin_host.py`, `src/kdf_mm/exchanges/`, `src/kdf_mm/network_diagnostics.py`, `src/kdf_mm/network_path.py` |
+
+See [optional hedging/shared coverage](docs/OPTIONAL_HEDGING_SHARED_COVERAGE.md).
+Hedging is immutable per strategy and UUID; do not remove uncertainty holds or
+use a display allocation snapshot as authority to spend.
 
 See [maker recovery invariants](docs/MAKER_RECOVERY_INVARIANTS.md); shared pool
 selection lives in `src/kdf_mm/inventory_reservations.py`.

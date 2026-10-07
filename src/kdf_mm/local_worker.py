@@ -192,6 +192,18 @@ def _verified_maker_refund(kdf, swap_uuid: str) -> bool:
 def local_settlement(journal_path, ownership, kdf=None):
     """Reconcile durable hedge evidence; never infer success or a refund."""
     def check(spec, store):
+        if not spec.hedging_enabled:
+            with store.lock:
+                rows = store.db.execute("SELECT swap_uuid,outcome FROM strategy_consumption WHERE strategy_id=?", (spec.strategy_id,)).fetchall()
+            for row in rows:
+                swap = ownership.get_swap(row['swap_uuid'])
+                order = ownership.get(swap.order_uuid) if swap is not None else None
+                if order is None or order.hedging_enabled or swap.acknowledged:
+                    continue
+                if row['outcome'] == 'SUCCEEDED' and swap.state.value == 'SUCCEEDED':
+                    ownership.acknowledge_swap(swap.swap_uuid)
+                # Failed unhedged swaps keep the existing manual review gate.
+            return
         path = Path(journal_path).resolve()
         if not path.is_file():
             return

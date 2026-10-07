@@ -190,7 +190,9 @@ class VpsController:
         on which to base a smaller CEX balance.
         """
         required: dict[str, Decimal] = {}
-        for order in self.ownership.active():
+        for order in getattr(self,"strategy_reservation_orders",self.ownership.active)():
+            if not getattr(order,"hedging_enabled",True):
+                continue
             if order.order_uuid == excluding_order_uuid:
                 continue
             reservation = (getattr(self, 'strategy_reservation', None)
@@ -215,7 +217,10 @@ class VpsController:
         if extra_plan is not None:
             plans = (*plans, extra_plan)
         for plan in plans:
-            custom = self.strategy_coverage(plan) if self.strategy_coverage else None
+            if not getattr(plan,"hedging_enabled",True):
+                continue
+            callback = getattr(self,"strategy_candidate_coverage",None)
+            custom = callback(plan,excluding_order_uuid) if callback else self.strategy_coverage(plan) if self.strategy_coverage else None
             if custom is not None:
                 for asset, amount in custom.items():
                     required[asset] = required.get(asset, Decimal(0)) + amount
@@ -266,7 +271,18 @@ class VpsController:
                 "override_active": False,
             }
         try:
-            return self.coverage.status(self.coverage_requirements(check_existing_depth=check_existing_depth))
+            claims = self._coverage_claims(check_depth=check_existing_depth)
+            required = {}
+            for _,_,amounts in claims:
+                for asset,q in amounts.items(): required[asset] = required.get(asset,Decimal(0))+q
+            status = self.coverage.status(required)
+            from .shared_coverage import SharedCoverageLedger
+            if not hasattr(self,'shared_coverage_ledger'):
+                self.shared_coverage_ledger = SharedCoverageLedger(self.ownership)
+            status['shared_allocation'] = self.shared_coverage_ledger.observe(claims,
+                {k:Decimal(v) for k,v in status['free_balances'].items()},
+                fresh=status['lease_fresh'],observed_ms=int(time.time()*1000))
+            return status
         except Exception as exc:
             status = self.coverage.status({})
             if status.get("override_active"):
@@ -302,10 +318,18 @@ class VpsController:
                 not lease.get('blocked') and not lease.get('override_active')):
             # A known depth shortfall belongs to one order. Unknown failures,
             # stale balances and aggregate funding gaps still fail closed globally.
-            for order in tuple(self.ownership.active()):
+            for order in reversed(tuple(self.ownership.active())):
+                if not getattr(order,"hedging_enabled",True): continue
                 try:
                     self.strategy_coverage(order)
                 except HedgeDepthError as exc:
+                    try:
+                        reducer = getattr(self,"strategy_reduce_coverage",None)
+                        if reducer and reducer(order):
+                            retired = True
+                            continue
+                    except Exception:
+                        pass
                     self.cancel_owned_order(order.order_uuid, reason=f"copertura ordine: {exc}", source='hedge_depth')
                     retired = True
                 except Exception as exc:
@@ -317,10 +341,47 @@ class VpsController:
         blocked = calculation_error or (str(status['reason']) if status.get('blocked') else None)
         if blocked is None:
             return not retired
+        protected = [o for o in self.ownership.active() if getattr(o,'hedging_enabled',True)]
+        if not protected: return not retired
         if self.kdf.orders_enabled:
-            for order in tuple(self.ownership.active()):
-                self.cancel_owned_order(order.order_uuid, reason=f"coverage circuit breaker: {blocked}", source='coverage')
+            victims = [o.order_uuid for o in protected]
+            if (not calculation_error and status.get('lease_fresh') and status.get('gaps')
+                    and status.get('live_hedging_enabled') and not status.get('override_active')):
+                from .shared_coverage import keep_funded_orders
+                _,victims = keep_funded_orders(self._coverage_claims(),status['free_balances'])
+            for uid in victims:
+                order = self.ownership.get(uid)
+                if order is None or order.status is not OwnedOrderStatus.OPEN: continue
+                reducer = getattr(self,'strategy_reduce_coverage',None)
+                try:
+                    if reducer and reducer(order):
+                        retired = True
+                        continue
+                except Exception:
+                    # Reduction must use durable update/readback. Do not release
+                    # its old capacity; withdraw this exact UUID conservatively.
+                    pass
+                self.cancel_owned_order(uid,reason=f'Shared coverage allocation: {blocked}',source='coverage')
         return False
+
+    def _coverage_claims(self, *, check_depth=False):
+        items = getattr(self,'strategy_reservation_orders',self.ownership.active)()
+        claims = []
+        ordered = sorted(items,key=lambda o:(
+            tuple(self.ownership.connection.execute('SELECT created_at FROM owned_orders WHERE order_uuid=?',
+                (o.order_uuid,)).fetchone() or ('',)),o.order_uuid))
+        for order in ordered:
+            if not getattr(order,'hedging_enabled',True): continue
+            reservation = self.strategy_coverage if check_depth else getattr(self,"strategy_reservation",None)
+            requirement = reservation(order) if reservation else None
+            if requirement is None:
+                requirement = {}
+                self._add_coverage_requirement(requirement,dex_side=order.dex_side,
+                    base_quantity=order.advertised_volume if order.dex_side is DexSide.SELL_ARRR else
+                    order.advertised_volume*order.kdf_price,market_id=order.market_id)
+            kind = 'swap' if order.order_uuid.startswith('swap:') else 'intent' if order.order_uuid.startswith('intent:') else 'maker'
+            claims.append((order.order_uuid,kind,requirement))
+        return claims
 
     def kdf_status(self) -> dict[str, Any]:
         try:
@@ -435,7 +496,7 @@ class VpsController:
             dict.fromkeys(
                 symbol
                 for market_id, spec in self.markets.items()
-                if activity[market_id]["active"]
+                if activity[market_id]["active"] and getattr(self,"strategy_market_reference",lambda _:True)(market_id)
                 for symbol in spec.required_symbols
             )
         )
@@ -598,6 +659,9 @@ class VpsController:
                     "reason": "coin_not_enabled_and_no_live_trade",
                     **activity[market_id],
                 }
+                continue
+            if getattr(self,"strategy_market_reference",lambda _:True)(market_id) is False:
+                result[market_id] = {"state":"FIXED_PRICE","reason":"No CEX reference required",**activity[market_id]}
                 continue
             try:
                 result[market_id] = {
@@ -905,7 +969,7 @@ class VpsController:
                 raise ActiveOrderLimitError(
                     f"one owned order is already open for {plan.market_id} {plan.dex_side.value}"
                 )
-            self._assert_market_fresh(plan.market_id)
+            self._assert_quote_market_fresh(plan)
             self._assert_pool_capacity(plan)
             self._assert_coverage(plan)
             minimum = self.strategy_min_volume(plan) if self.strategy_min_volume else None
@@ -914,11 +978,12 @@ class VpsController:
             intent_id = None
             def record_intent(before):
                 nonlocal intent_id
-                max_age = min(self.market_data_by_symbol[s].max_age_ms
-                              for s in self.market_spec(plan.market_id).required_symbols)
+                max_age = (min(self.market_data_by_symbol[s].max_age_ms
+                               for s in self.market_spec(plan.market_id).required_symbols)
+                           if plan.market_reference_required else 10000)
                 if (time.monotonic() - started) * 1000 >= max_age:
                     raise ValueError('preflight troppo lento: ricalcolare il piano prima di pubblicare')
-                self._assert_market_fresh(plan.market_id)
+                self._assert_quote_market_fresh(plan)
                 self._assert_coverage(plan)
                 if plan.strategy_id:
                     intent_id = self.publications.begin(plan, before, minimum)
@@ -942,10 +1007,12 @@ class VpsController:
 
     def update_owned_quote(self, order_uuid: str, plan: QuotePlan, *, before_write=None) -> OwnedOrder:
         with self._order_lock, rebalance_guard(self.rebalance_lock_path):
-            self._assert_market_fresh(plan.market_id)
+            self._assert_quote_market_fresh(plan)
             owned = self.ownership.get(order_uuid)
             if owned is None or owned.status is not OwnedOrderStatus.OPEN:
                 raise KeyError(order_uuid)
+            if (owned.hedging_enabled,owned.market_reference_required) != (plan.hedging_enabled,plan.market_reference_required):
+                raise ValueError("Immutable UUID hedging policy cannot change")
             if (owned.market_id, owned.dex_side, owned.kdf_base, owned.kdf_rel) != (
                 plan.market_id,
                 plan.dex_side,
@@ -976,7 +1043,7 @@ class VpsController:
                 delta = plan.kdf_volume - old_max
                 # Readback may spend several seconds waiting for KDF. Check
                 # current exposure again before recording/sending a mutation.
-                self._assert_market_fresh(plan.market_id)
+                self._assert_quote_market_fresh(plan)
                 self._assert_coverage(plan, excluding_order_uuid=order_uuid)
                 before_write(owned, minimum, old_price, old_max)
                 if (old_price == plan.kdf_price and delta == 0
@@ -1102,12 +1169,19 @@ class VpsController:
         for market_id in self.markets:
             if not activity[market_id]["active"]:
                 continue
+            if not getattr(self,"strategy_market_reference",lambda _:True)(market_id):
+                continue
             try:
                 self._assert_market_fresh(market_id)
             except StaleMarketData as exc:
                 all_fresh = False
                 for order in tuple(self.ownership.active()):
-                    if order.market_id == market_id:
+                    if order.market_id == market_id and getattr(order,"market_reference_required",True):
+                        try:
+                            self._assert_quote_market_fresh(order)
+                            continue
+                        except StaleMarketData:
+                            pass
                         self.cancel_owned_order(order.order_uuid, reason=f"market-data circuit breaker: {exc}", source='market_data')
         return all_fresh
 
@@ -1158,6 +1232,11 @@ class VpsController:
                 raise KdfCoinStateUnavailable(age)
             return set(self._coin_snapshot)
 
+    def _assert_quote_market_fresh(self, item):
+        if not getattr(item,'market_reference_required',True): return
+        for symbol in self.market_spec(item.market_id).required_symbols:
+            self.market_data_by_symbol[symbol].current(price_only=not getattr(item,'hedging_enabled',True))
+
     def _assert_market_fresh(self, market_id: str) -> None:
         for symbol in self.market_spec(market_id).required_symbols:
             self.market_data_by_symbol[symbol].current()
@@ -1173,7 +1252,8 @@ class VpsController:
             return
         maximum = Decimal(_numeric_decimal(max_maker_volume(plan.inventory_pool), "volume"))
         already_advertised = reserved_pool_volume(
-            self.ownership.active_for_pool(plan.inventory_pool), plan.inventory_pool,
+            [o for o in getattr(self,"strategy_reservation_orders",self.ownership.active)()
+             if getattr(o,"reservation_kind",None)!="swap"], plan.inventory_pool,
             excluding=(excluding_order_uuid,),
         )
         requested_total = already_advertised + plan.kdf_volume
@@ -1190,6 +1270,8 @@ class VpsController:
         *,
         excluding_order_uuid: str | None = None,
     ) -> None:
+        if not getattr(plan,"hedging_enabled",True):
+            return
         if self.coverage is None:
             return
         try:

@@ -82,3 +82,108 @@ and status numbers use an explicit field allowlist.
 The private read-only monitoring collector accepts both journal formats, keeps
 only strict metadata, aggregate counts/maxima, recent errors and unmatched starts.
 This instrumentation leaves TTLs, retries and order safety checks unchanged.
+
+
+## Phase diagnostics extension (source candidate, 2026-10-07)
+
+This extension requires a rebuilt engine. Fine MEXC HTTP phases additionally
+require the companion CEX_configs MEXC 0.1.1 adapter; old v1 adapters remain
+compatible and simply lack those measurements. Changing source/catalog files
+never hot-updates an already running process.
+
+- `http_request_end` shares the enclosing KDF/plugin request ID. `http_sequence`
+  distinguishes up to eight HTTP calls within a single adapter method. Only
+  bounded fixed phase labels, monotonic durations, numeric HTTP status/errno and
+  fixed failure categories cross this boundary. No endpoint/hostnames, headers,
+  response size, payloads, account amounts or order identifiers are recorded.
+- aiohttp phases identify DNS, connection acquisition, connection establishment
+  including TLS/proxy negotiation, request send, headers wait, body and decoding.
+  `connection_total_ms` includes DNS; do not sum it with `dns_ms`. The connection
+  phase does not split TCP, TLS and a Tor proxy's upstream work. Headers wait can
+  include request-body upload, network latency and remote processing; it is not
+  a measurement of exchange compute time. A proxy route may resolve the remote
+  hostname upstream, so absence of a local DNS phase is not a DNS failure.
+- urllib (including current KDF loopback calls) retains its existing socket
+  timeout and can measure only `connect_or_headers` and `response_body`.
+  Neither transport changes routing, redirects, deadlines or retry behavior.
+- Optional host `diagnostic_phase` frames contain only protocol sequence ID and
+  fixed phase. They share the **original** reply deadline and cannot extend it.
+  The last received phase survives in `plugin_request_end` when the final reply
+  times out; it is the last *observed* phase, not proof of the precise blocking
+  point. Old adapters/hosts emit no frames. At most 64 frames per method.
+- `adapter_thread_cpu_ms` / `adapter_process_cpu_ms` help distinguish CPU work
+  from elapsed waiting/scheduling. Low CPU cannot distinguish network waiting
+  from process suspension. `plugin_pid`, `protocol_sequence` and
+  `plugin_lifecycle` (spawn/close/exit, numeric return code) identify host churn
+  without reading process command lines or environment.
+- `coverage_stage_start/end` use a correlation ID for each renewal stage.
+  `coverage_publication_hold` with reason `renewal_failed` records the trigger
+  requiring fail-closed recovery, not successful delivery of the hold. Existing
+  lease/coverage policies remain the authority; no balances are added to logs.
+
+Each writer also keeps `engine-network-incidents.jsonl` (or worker equivalent),
+8 MiB plus two backups, private 0600. It mirrors errors, HTTP failures, rejected
+markets, lifecycle and operations lasting at least 5 seconds. A heartbeat at
+most once per minute **while records are being written** shows retained logging
+activity; absence may mean idle, exit or writer trouble, not service death.
+`diagnostic_write_failures` and `dropped_records` report losses when writing
+recovers. Logging remains asynchronous, bounded and never retries a trade.
+The sparse incident history does not restore a missing complete request history.
+
+Monitoring deduplicates mirrored records, reports coverage per journal and
+preserves strict metadata allowlists. Check coverage of full and sparse logs
+separately before drawing conclusions. Offline/live acceptance of this source
+candidate is separate from syntax review and packaging.
+
+
+## Resolver/local-path metadata (source candidate, 2026-10-07)
+
+MEXC 0.1.2 plus the companion engine adds session/connection/cache reuse flags,
+`resolver_queue_ms`, `resolver_call_ms` and `resolver_inflight` to existing
+correlated HTTP records. This distinguishes local executor contention from time
+inside OS getaddrinfo. The latter can include NSS, local stub/cache and upstream
+DNS; it is not provider-server compute time. A pending/shared DNS resolution
+can produce a cache signal while still waiting; use durations and in-flight
+flags as well. No read/write retry, DNS override, market TTL change or additional
+network query is used by these measurements.
+
+`network_path_sample` is produced asynchronously every 30 seconds, with no
+probe packets. On Linux it samples the IPv4 default-route interface's numeric
+index, carrier changes and RX/TX error/drop totals/deltas; when exposed by the
+driver, legacy wireless quality/signal and retry-discard/missed-beacon counters.
+Missing driver counters remain absent with `wifi_stats_available=false`.
+Counter reset or interface change invalidates deltas (`link_sample_reset`).
+These counters cover all host traffic, not just the wallet; zero counters do not
+prove absence of Wi-Fi interference. The IPv4 default route may differ from
+an individual IPv6/VPN/proxied request's actual path; no IPv4 default route is
+reported as unavailable, not offline.
+
+Resolver configuration records only fixed categories: `local_stub`, `gateway`,
+`private`, `public`, `mixed`, `unknown`. A gateway-configured DNS suggests using
+the router as a resolver/proxy, but does not prove it caused the delay. A public
+DNS address does not identify ownership by the ISP. Read-only resolvectl queries
+collect configured DNS class and recognized numeric aggregate statistics when
+available. Permission denial, absent service/tool or unknown JSON schema means
+`resolver_stats_available=false`; never substitute zero, request privileges,
+flush caches or change settings. The bounded subprocess reads run on a separate
+sampler thread with one-second timeouts. No hostnames, IP/MAC addresses, SSIDs,
+resolver cache contents, packet capture, keys or financial data are persisted.
+
+Correlate HTTP timestamps with path samples: long local queue suggests executor
+contention; low queue with long OS call points to the system-resolution path;
+carrier/drop changes or Wi-Fi counters provide separate link evidence. Samples
+are hints, not automatic causal verdicts. Distinguishing router, Wi-Fi loss,
+provider DNS and remote endpoint conclusively needs controlled independent
+measurements/telemetry; this passive instrumentation explicitly leaves those
+cases unresolved. An unavailable resolver counter is not a network failure.
+
+
+### Universal adapter coverage
+
+The common CEX_configs HTTP-core candidate now extends the preceding MEXC-only
+session/resolver notes to every generated Spot adapter. Venue names are supplied
+by the engine host, not hard-coded in diagnostics. Native signing/decoding and
+experimental venue limits remain unchanged. Passive host-path samples remain
+whole-host context, not proof that a particular venue/router/provider is slow.
+Runtime deployment must confirm the new engine and companion immutable catalog;
+source edits alone do not enable these metrics.

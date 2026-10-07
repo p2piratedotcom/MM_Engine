@@ -82,6 +82,12 @@ class StrategyStore:
                 VALUES(NEW.id,NEW.state,NEW.detail,NEW.confirmations,NEW.preview);
             END;
         """)
+        self.db.executescript("""
+            CREATE TRIGGER IF NOT EXISTS strategy_hedging_immutable
+            BEFORE UPDATE OF spec ON strategies
+            WHEN coalesce(json_extract(NEW.spec,'$.hedging_enabled'),1) != coalesce(json_extract(OLD.spec,'$.hedging_enabled'),1)
+            BEGIN SELECT RAISE(ABORT,'Hedging is immutable; create a new maker'); END;
+        """)
         self._ensure_creation_numbers()
         self._market_sample_writes = 0
 
@@ -269,6 +275,8 @@ class StrategyStore:
         with self.lock:
             row = self.get(spec.strategy_id)
             previous = StrategySpec.from_payload(row["spec"])
+            if previous.hedging_enabled != spec.hedging_enabled:
+                raise ValueError("Hedging cannot be changed on an existing maker; create a new maker")
             if row["enabled"] or row["state"] in {"WRITING", "REVIEW_REQUIRED", "DELETED"}:
                 raise ValueError("mettere in pausa e risolvere le anomalie prima di modificare")
             if (previous.base, previous.quote, previous.side, previous.cex) != (

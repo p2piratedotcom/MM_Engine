@@ -73,6 +73,10 @@ class StrategyService:
                 else:
                     store.update(spec.strategy_id, enabled=0, state="REVIEW_REQUIRED",
                                  detail="Riavvio durante scrittura KDF: riconciliare gli ordini prima di proseguire")
+        controller.strategy_reservation_orders = self.reservation_orders
+        controller.strategy_reduce_coverage = self.reduce_coverage
+        controller.strategy_candidate_coverage = lambda plan,exclude: self.coverage_requirement(plan,excluding_order_uuid=exclude)
+        controller.strategy_market_reference = self.market_reference_required
         controller.strategy_coverage = self.coverage_requirement
         # Keep other orders' funds reserved without making their depth failure
         # a reason to cancel the unrelated order currently being repriced.
@@ -107,6 +111,8 @@ class StrategyService:
         spec = spec_override or self._for_quote(plan)
         if spec is None:
             return None
+        if not spec.hedging_enabled:
+            return None  # KDF validates native swap minimums and fees.
         minimum = D(0)
         coarse_step = False
         for leg in self._legs(spec, D(1), plan.kdf_price):
@@ -161,7 +167,7 @@ class StrategyService:
 
     def _register(self, spec: StrategySpec, *, validate: bool) -> None:
         c = self.controller
-        client = self._client(spec)
+        client = self._client(spec) if spec.requires_reference else None
         if validate and not {spec.base.ticker, spec.quote.ticker} <= set(c.enabled_tickers()):
             raise ValueError("attivare entrambe le coin KDF prima di configurare la strategia")
         for route in (spec.base, spec.quote):
@@ -169,27 +175,32 @@ class StrategyService:
                 continue
             if validate and client is not None:
                 rules = client.symbol_rules(route.symbol)
-                if rules.base_asset != route.asset or rules.quote_asset != "USDT" or not all(rules.allows(s) for s in HedgeSide) or "LIMIT" not in rules.order_types:
+                if rules.base_asset != route.asset or rules.quote_asset != "USDT" or (spec.hedging_enabled and (not all(rules.allows(s) for s in HedgeSide) or "LIMIT" not in rules.order_types)):
                     raise ValueError(f"route Spot non negoziabile: {route.symbol}")
             key = self._key(spec, route.symbol)
             if key not in c.market_data_by_symbol:
-                if self.feeds is None:
+                if self.feeds is None and spec.requires_reference:
                     raise ValueError(f"feed pubblico {spec.cex} richiesto")
                 template = c.market_data
                 data = MarketDataStore(symbol=route.symbol, secret=template.secret,
                                        clock_ms=template.clock_ms, max_age_ms=template.max_age_ms)
-                feed = MexcPublicFeed(client=client, store=data, snapshot_secret=template.secret,
+                c.market_data_by_symbol = {**c.market_data_by_symbol, key: data}
+            if spec.requires_reference and self.feeds is not None and key not in self.feeds.feeds:
+                data = c.market_data_by_symbol[key]
+                feed = MexcPublicFeed(client=client, store=data, snapshot_secret=data.secret,
                                       symbol=route.symbol, venue=spec.cex,
                                       client_factory=(lambda venue=spec.cex: self.public_client_factory(venue))
                                       if self.public_client_factory else None)
                 self.feeds.add(key, feed)
-                c.market_data_by_symbol = {**c.market_data_by_symbol, key: data}
-            if validate and self.feeds is not None:
-                # Read-only refresh for the initial preview; render thread never
-                # calls this. Existing pollers continue to supply running quotes.
+            c.market_data_by_symbol[key].price_reference_only = (
+                not spec.hedging_enabled and spec.price_mode=='auto' or any(
+                    not item.hedging_enabled and item.price_mode=='auto' and item.strategy_id!=spec.strategy_id
+                    and route.symbol in {item.base.symbol,item.quote.symbol} and item.cex==spec.cex
+                    for item in self._specs.values()))
+            if validate and spec.requires_reference and self.feeds is not None:
                 self.feeds.feeds[key].fetch_once()
         market = MarketSpec(spec.market_id, spec.quote.ticker, spec.base.ticker,
-                            self._key(spec, spec.base.symbol),
+                            self._key(spec,spec.base.symbol) if spec.base.symbol else "FIXED:"+spec.market_id,
                             self._key(spec, spec.quote.symbol) if spec.quote.symbol else None,
                             2 if spec.quote.symbol else 1)
         if spec.market_id in c.markets and c.markets[spec.market_id] != market:
@@ -222,6 +233,7 @@ class StrategyService:
                         'held': any(i['state'] == 'HELD' for i in pending),
                         'next_retry_seconds': max(0, round(10 - (time.monotonic() - checked)))}
             return {"schema_version": 1, "strategies": rows, "local_first": True,
+                    "shared_coverage": self.controller.coverage_status(check_existing_depth=False).get("shared_allocation"),
                     "worker_running": bool(self.thread and self.thread.is_alive())}
 
     def refunded_swap_uuids(self) -> tuple[str, ...]:
@@ -286,15 +298,21 @@ class StrategyService:
         return True
 
     def _legs(self, spec, sold, bought):
+        if not spec.hedging_enabled:
+            return ()
         return tuple({"symbol": route.symbol, "market_data_key": self._key(spec, route.symbol),
                       "asset": route.asset, "side": side, "quantity": str(amount),
                       "kdf_ticker": route.ticker, "cex": spec.cex}
                      for route, side, amount in ((spec.sold, "BUY", sold), (spec.bought, "SELL", bought)) if route.symbol)
 
-    def coverage_requirement(self, item, spec_override=None, *, check_depth=True):
+    def coverage_requirement(self, item, spec_override=None, *, check_depth=True, excluding_order_uuid=None):
+        if getattr(item,"coverage_override",None) is not None:
+            return dict(item.coverage_override)
         spec = spec_override or self._for_quote(item)
         if spec is None:
             return None
+        if not getattr(item, "hedging_enabled", True) or not spec.hedging_enabled:
+            return {}
         needed = {}
         volume = self._coverage_volume(item)
         for leg in self._legs(spec, volume, volume * item.kdf_price):
@@ -304,10 +322,21 @@ class StrategyService:
             levels = book.asks if side is HedgeSide.BUY else book.bids
             quantity = D(leg["quantity"])
             capacity = quantity_within_slippage(levels, side=side, max_slippage=spec.impact) * spec.depth_fraction
-            if check_depth and capacity < quantity:
+            other_depth = D(0)
+            if check_depth:
+                for other in self.reservation_orders():
+                    if getattr(other,'coverage_override',None) is not None: continue
+                    if other.order_uuid in {getattr(item,'order_uuid',None),excluding_order_uuid}: continue
+                    other_spec = self._for_quote(other)
+                    if other_spec is None or other_spec.cex != spec.cex: continue
+                    v = self._coverage_volume(other)
+                    for candidate in self._legs(other_spec,v,v*other.kdf_price):
+                        if (candidate['symbol'],candidate['side']) == (leg['symbol'],leg['side']):
+                            other_depth += D(candidate['quantity'])
+            if check_depth and capacity < quantity+other_depth:
                 raise HedgeDepthError(f"{spec.sold.ticker} → {spec.bought.ticker}: profondità hedge ridotta; "
                                       f"{side.value} {leg['asset']} richiede {quantity}, "
-                                      f"massimo {capacity}. Ritirare/ridimensionare questo ordine.")
+                                      f"massimo condiviso residuo {max(D(0),capacity-other_depth)}. Ritirare/ridimensionare questo ordine.")
             if side is HedgeSide.BUY:
                 # Reserve for upward CEX precision rounding as well as fees.
                 quantity = (quantity / snap.quantity_step).to_integral_value(rounding=ROUND_CEILING) * snap.quantity_step
@@ -332,6 +361,22 @@ class StrategyService:
         diagnostics_only=False, allow_read_only=False,
     ):
         c = self.controller
+        if not spec.hedging_enabled:
+            active = [o for o in self.reservation_orders() if getattr(o,'order_uuid',None) not in set(exclude_many)|{exclude}]
+            committed = reserved_pool_volume([o for o in active if getattr(o,"reservation_kind",None)!="swap"],spec.sold.ticker,volume_of=self._coverage_volume)
+            committed += reserved_pool_volume(extra,spec.sold.ticker)
+            maximum = D(_numeric_decimal(c.kdf.max_maker_volume(spec.sold.ticker),'volume'))
+            remaining,daily = self.store.remaining(spec)
+            snapshots = {r.symbol:c.market_data_by_symbol[self._key(spec,r.symbol)].current(price_only=True)
+                         for r in (spec.base,spec.quote) if r.symbol} if spec.requires_reference else {}
+            sizing_spec = (replace(spec,fixed_sold=min(spec.fixed_sold,remaining))
+                           if spec.quantity_mode=="fixed" and not spec.replenish and remaining is not None and remaining>0 else spec)
+            preview = preview_strategy(sizing_spec,snapshots,kdf_free=max(D(0),maximum-committed),
+                                       cex_free={},remaining_budget=remaining,daily_remaining=daily,
+                                       diagnostics_only=diagnostics_only)
+            if diagnostics_only: return preview
+            evidence = preview.evidence or (('KDF',int(self.clock()*1000)),)
+            return replace(preview,evidence=evidence,plan=replace(preview.plan,strategy_id=spec.strategy_id))
         coverage = c.coverage.status({}) if c.coverage else {}
         if (not coverage.get("lease_fresh") and allow_read_only
                 and self.preview_balances is not None):
@@ -351,7 +396,7 @@ class StrategyService:
         excluded = set(exclude_many) | {exclude}
         needed = {}
         reserved = {}
-        active = [o for o in c.ownership.active() if o.order_uuid not in excluded]
+        active = [o for o in self.reservation_orders() if o.order_uuid not in excluded]
         for order in active:
             requirement = self.coverage_requirement(order, check_depth=False)
             if requirement is None and exclude_many:
@@ -390,7 +435,7 @@ class StrategyService:
                 for asset in {"USDT", spec.base.asset, spec.quote.asset}}
         maximum = D(_numeric_decimal(c.kdf.max_maker_volume(spec.sold.ticker), "volume"))
         committed = reserved_pool_volume(
-            (*active, *extra), spec.sold.ticker, volume_of=self._coverage_volume,
+            (*[o for o in active if getattr(o,"reservation_kind",None)!="swap"], *extra), spec.sold.ticker, volume_of=self._coverage_volume,
         )
         remaining, daily = self.store.remaining(spec)
         snapshots = {r.symbol: c.market_data_by_symbol[self._key(spec, r.symbol)].current()
@@ -442,7 +487,7 @@ class StrategyService:
             mode = payload.get("opposite", "no")
             if mode not in {"no", "si", "personalizza"}:
                 raise ValueError("mercato speculare non valido")
-            costs = self._fee(source) * (2 if source.quote.symbol else 1) + self.controller.risk_buffer
+            costs = (self._fee(source) * (2 if source.quote.symbol else 1) + self.controller.risk_buffer) if source.hedging_enabled else D(0)
             sign = 1 if source.side is DexSide.SELL_ARRR else -1
             fixed_price = (source.fixed_price * (1 + premium + sign * costs) /
                            (1 + source.premium + sign * costs)) if source.price_mode == "fixed" else None
@@ -456,7 +501,7 @@ class StrategyService:
             if not self.controller.kdf.orders_enabled:
                 raise ValueError("pubblicazione live disabilitata")
             coverage = self.controller.coverage.status({}) if self.controller.coverage else {}
-            if not coverage.get("live_hedging_enabled") or coverage.get("strategy_version") != 1:
+            if source.hedging_enabled and (not coverage.get("live_hedging_enabled") or coverage.get("strategy_version") != 1):
                 raise ValueError(f"worker {source.cex} live non pronto")
             self._register(first, validate=True)
             # Automatic siblings can give up capacity, but only after a preview
@@ -467,15 +512,18 @@ class StrategyService:
             specs = [first]
             previews = [self._preview(first, exclude_many=excluded)]
             if mode != "no":
-                book = self.controller.market_data_by_symbol[self._key(source, source.base.symbol)].current().order_book()
                 reverse_sell = source.side is DexSide.BUY_ARRR
-                bp = book.asks[0].price if reverse_sell else book.bids[0].price
-                qp = D(1)
-                if source.quote.symbol:
-                    qbook = self.controller.market_data_by_symbol[self._key(source, source.quote.symbol)].current().order_book()
-                    qp = qbook.bids[0].price if reverse_sell else qbook.asks[0].price
                 rp = -premium if mode == "si" else D(str(payload["opposite_premium"])) / 100
-                price = bp / qp * (1 + rp + (costs if reverse_sell else -costs))
+                if not source.requires_reference:
+                    price = source.fixed_price*(1+rp)/(1+source.premium)
+                else:
+                    book = self.controller.market_data_by_symbol[self._key(source, source.base.symbol)].current(price_only=not source.hedging_enabled).order_book()
+                    bp = book.asks[0].price if reverse_sell else book.bids[0].price
+                    qp = D(1)
+                    if source.quote.symbol:
+                        qbook = self.controller.market_data_by_symbol[self._key(source, source.quote.symbol)].current(price_only=not source.hedging_enabled).order_book()
+                        qp = qbook.bids[0].price if reverse_sell else qbook.asks[0].price
+                    price = bp / qp * (1 + rp + (costs if reverse_sell else -costs))
                 reverse = opposite_spec(first, previews[0], price)
                 parents = [s for s in self._specs.values() if s.market_id == reverse.market_id and s.side == reverse.side]
                 reverse = replace(reverse, premium=rp, scale_group=(parents[0].scale_group or parents[0].strategy_id) if parents else reverse.strategy_id)
@@ -591,7 +639,10 @@ class StrategyService:
         spec = StrategySpec.from_payload(raw_spec)
         self._register(spec, validate=True)
         first = self._preview(spec)
-        snapshots = {r.symbol: self.controller.market_data_by_symbol[self._key(spec, r.symbol)].current()
+        if not spec.requires_reference:
+            opposite = opposite_spec(spec,first,spec.fixed_price)
+            return {"spec":opposite.payload(),"notice":"DEX-only opposite maker; no CEX hedge will be sent"}
+        snapshots = {r.symbol: self.controller.market_data_by_symbol[self._key(spec, r.symbol)].current(price_only=not spec.hedging_enabled)
                      for r in (spec.base, spec.quote) if r.symbol}
         sell_base = spec.side is DexSide.BUY_ARRR
         base_book = snapshots[spec.base.symbol].order_book()
@@ -600,7 +651,7 @@ class StrategyService:
         if spec.quote.symbol:
             book = snapshots[spec.quote.symbol].order_book()
             qp = book.bids[0].price if sell_base else book.asks[0].price
-        costs = self._fee(spec) * (2 if spec.quote.symbol else 1) + self.controller.risk_buffer
+        costs = (self._fee(spec) * (2 if spec.quote.symbol else 1) + self.controller.risk_buffer) if spec.hedging_enabled else D(0)
         price = bp / qp * (1 - spec.premium + (costs if sell_base else -costs))
         opposite = opposite_spec(spec, first, price)
         return {"spec": opposite.payload(), "notice": "Quantità equivalente in asset base all'anteprima corrente; i limiti di sicurezza possono ridurla se automatica."}
@@ -610,6 +661,8 @@ class StrategyService:
         with self.lock, self.controller._order_lock:
             row = self.store.get(spec.strategy_id)
             previous = self._specs[spec.strategy_id]
+            if spec.hedging_enabled != previous.hedging_enabled:
+                raise ValueError("Hedging cannot be changed on an existing maker; create a new maker")
             if spec.scale_group != previous.scale_group or any(
                 s.strategy_id != spec.strategy_id and (s.sold.ticker, s.bought.ticker) == (spec.sold.ticker, spec.bought.ticker)
                 and s.premium == spec.premium for s in self._specs.values()
@@ -760,8 +813,14 @@ class StrategyService:
                 self.controller.ownership.bind_strategy(order.order_uuid, sid)
         if sid is not None:
             terms = _swap_terms(status)
+            if (str(status.get('uuid')) != swap.swap_uuid or swap.order_uuid != order.order_uuid
+                    or terms['maker_coin'] != order.kdf_base or terms['taker_coin'] != order.kdf_rel):
+                raise ValueError('Swap identity/currencies differ from immutable maker UUID')
             self.store.record_swap(strategy_id=sid, swap_uuid=swap.swap_uuid,
                                    sold=D(terms["maker_amount"]), outcome=swap.state.value)
+        if sid is not None and not getattr(order,"hedging_enabled",True) and swap.state is OwnedSwapState.SUCCEEDED and self.settlement:
+            historical = self._specs.get(sid) or StrategySpec.from_payload(self.store.get(sid)["spec"])
+            self.settlement(historical,self.store)
 
     def hedge_route(self, order, terms):
         sid = self.store.strategy_for_order(order.order_uuid)
@@ -1358,12 +1417,14 @@ class StrategyService:
                 for existing in held_orders:
                     if not {existing.kdf_base, existing.kdf_rel} <= set(c.enabled_tickers()):
                         raise ValueError("coin non attive")
-                    c._assert_market_fresh(spec.market_id)
+                    c._assert_quote_market_fresh(existing)
                     c._assert_pool_capacity(SimpleNamespace(
                         strategy_id=spec.strategy_id, inventory_pool=existing.inventory_pool,
                         kdf_base=existing.kdf_base, kdf_rel=existing.kdf_rel,
                         kdf_volume=existing.advertised_volume),
                         excluding_order_uuid=existing.order_uuid)
+                    if not spec.hedging_enabled:
+                        continue
                     if c.coverage is None:
                         raise ValueError("copertura hedge non disponibile")
                     blocked = c.coverage.block_reason(c.coverage_requirements())
@@ -1382,7 +1443,7 @@ class StrategyService:
             raise ValueError(block)
         if not {spec.sold.ticker, spec.bought.ticker} <= set(c.enabled_tickers()):
             raise ValueError("coin non attive")
-        if c.coverage is None or not c.coverage.status({}).get("live_hedging_enabled") or c.coverage.status({}).get("strategy_version") != 1:
+        if spec.hedging_enabled and (c.coverage is None or not c.coverage.status({}).get("live_hedging_enabled") or c.coverage.status({}).get("strategy_version") != 1):
             raise ValueError(f"worker {spec.cex} live non pronto")
         all_orders = c.active_orders_for_market_side(spec.market_id, spec.side)
         orders = self.orders_for(spec)
@@ -1395,7 +1456,7 @@ class StrategyService:
             self.store.update(spec.strategy_id, enabled=0, state="EXHAUSTED", detail="budget totale esaurito")
             return
         if order is None:
-            coverage_status = c.coverage.status({})
+            coverage_status = c.coverage.status({}) if spec.hedging_enabled and c.coverage else {}
             if not coverage_status.get("publication_ready", True):
                 self.store.update(spec.strategy_id, state="WAITING",
                     detail=f"ripubblicazione sospesa: attesa rinnovo completo {spec.cex}",
@@ -1515,3 +1576,118 @@ class StrategyService:
         self.stop.set()
         if self.thread:
             self.thread.join(timeout=30)
+
+
+    def market_reference_required(self, market_id):
+        specs = [s for s in self._specs.values() if s.market_id == market_id]
+        return any(s.requires_reference for s in specs) if specs else True
+
+    def reservation_orders(self):
+        """One owner per UUID; uncertain updates keep a high-water reservation."""
+        from dataclasses import replace as clone
+        from .publication_recovery import decode_plan
+        active = list(self.controller.ownership.active())
+        by_uuid = {o.order_uuid:o for o in active}
+        with self.store.lock:
+            updates = self.store.db.execute("SELECT * FROM strategy_update_intents WHERE state != 'DONE'").fetchall()
+        for row in updates:
+            uid = row['order_uuid']
+            if uid not in by_uuid: continue
+            old = by_uuid[uid]
+            high = max(old.advertised_volume,D(row['old_volume']),D(row['new_volume']))
+            by_uuid[uid] = clone(old,kdf_volume=high,kdf_max_volume=high,
+                                kdf_price=max(old.kdf_price,D(row['old_price']),D(row['new_price'])))
+        pubs = self.controller.publications
+        with pubs.lock:
+            pending = pubs.db.execute("SELECT id,plan,order_uuid FROM publication_intents WHERE state IN ('PENDING','REGISTERED','HELD')").fetchall()
+        result = list(by_uuid.values())
+        for row in pending:
+            uid = row['order_uuid']
+            if uid in by_uuid: continue
+            if uid is not None and self.controller.ownership.get(uid) is not None:
+                continue  # Terminal UUID readback is definitive; never revive its intent.
+            plan = decode_plan(json.loads(row['plan']))
+            result.append(SimpleNamespace(**vars_for_plan(plan),order_uuid='intent:'+row['id'],
+                                          advertised_volume=plan.kdf_volume))
+        # Existing worker policy refuses fresh balance leases during unresolved
+        # hedges. Retain the matched obligation too until filled journal proof.
+        import sqlite3
+        from pathlib import Path
+        dbpath = getattr(self.controller,'shared_hedge_journal',None)
+        with self.controller.ownership._lock:
+            unacked = self.controller.ownership.connection.execute("SELECT * FROM owned_swaps WHERE acknowledged=0").fetchall()
+        for swap in map(self.controller.ownership._swap_from_row,unacked):
+            if swap.acknowledged: continue
+            order = self.controller.ownership.get(swap.order_uuid)
+            if order is None or not order.hedging_enabled: continue
+            complete = False
+            if dbpath and Path(dbpath).is_file():
+                with sqlite3.connect(Path(dbpath).resolve().as_uri()+'?mode=ro',uri=True) as db:
+                    h = db.execute('SELECT state,target_quantity,filled_quantity FROM hedges WHERE swap_uuid=?',(swap.swap_uuid,)).fetchone()
+                    legs = (db.execute('SELECT plan,state,result FROM basket_legs WHERE swap_uuid=?',(swap.swap_uuid,)).fetchall()
+                            if db.execute("SELECT 1 FROM sqlite_master WHERE name='basket_legs'").fetchone() else [])
+                    complete = bool(h and h[0]=='FILLED' and D(h[1])==D(h[2]) and legs and all(l[1]=='FILLED' for l in legs))
+            if complete:
+                # Filled spending has left account.free already. Protect the
+                # acquired inventory until the DEX outcome is acknowledged.
+                spec = self._for_quote(order)
+                acquired = {}
+                for leg in legs:
+                    plan,result_leg = json.loads(leg[0]),json.loads(leg[2])
+                    asset = plan['asset'] if plan['side']=='BUY' else 'USDT'
+                    qty = D(result_leg['executedQty'] if plan['side']=='BUY' else result_leg['cummulativeQuoteQty'])
+                    for fill in result_leg.get('fills',[]):
+                        if fill.get('commissionAsset')==asset:
+                            commission = D(fill['commission'])
+                            if not commission.is_finite() or not 0<=commission<=qty:
+                                raise ValueError('Invalid settled hedge commission')
+                            qty -= commission
+                    key = self._coverage_key(spec,asset) if spec is not None else asset
+                    acquired[key] = acquired.get(key,D(0))+max(D(0),qty)
+                result.append(SimpleNamespace(order_uuid='swap:'+swap.swap_uuid,
+                    strategy_id=self.store.strategy_for_order(order.order_uuid) or '',
+                    dex_side=order.dex_side,market_id=order.market_id,inventory_pool=order.inventory_pool,
+                    kdf_base=order.kdf_base,kdf_rel=order.kdf_rel,kdf_volume=D(0),kdf_price=order.kdf_price,
+                    advertised_volume=D(0),hedging_enabled=True,market_reference_required=True,
+                    reservation_kind='swap',coverage_override=acquired))
+                continue
+            volume = swap.base_quantity if order.dex_side is DexSide.SELL_ARRR else swap.base_quantity*order.kdf_price
+            result.append(SimpleNamespace(order_uuid='swap:'+swap.swap_uuid,
+                strategy_id=self.store.strategy_for_order(order.order_uuid) or '',
+                dex_side=order.dex_side,market_id=order.market_id,inventory_pool=order.inventory_pool,
+                kdf_base=order.kdf_base,kdf_rel=order.kdf_rel,kdf_volume=volume,kdf_price=order.kdf_price,
+                advertised_volume=volume,hedging_enabled=True,market_reference_required=True,
+                reservation_kind='swap'))
+        return tuple(result)
+
+    def reduce_coverage(self, order):
+        """Reduce an automatic quote only through normal guarded update intents."""
+        spec = self._for_quote(order)
+        if spec is None or spec.quantity_mode != 'auto': return False
+        row = self.store.get(spec.strategy_id)
+        if not row['enabled'] or self.store.update_intent(spec.strategy_id): return False
+        capped = replace(spec,max_sold=min(spec.max_sold,order.advertised_volume/spec.auto_fraction)
+                         if spec.max_sold else order.advertised_volume/spec.auto_fraction)
+        preview = self._preview(capped,exclude=order.order_uuid)
+        plan = preview.plan
+        if not 0 < plan.kdf_volume < order.advertised_volume: return False
+        self.minimum_volume(plan,spec)
+        def intent(owned,minimum,old_price,old_max):
+            self.store.begin_update(spec.strategy_id,owned.order_uuid,old_price=old_price,old_volume=old_max,
+                                    new_price=plan.kdf_price,new_volume=plan.kdf_volume,min_volume=minimum)
+            self.store.update(spec.strategy_id,state='WRITING',detail='Reducing automatic quantity to restore shared coverage')
+        try:
+            self.controller.update_owned_quote(order.order_uuid,plan,before_write=intent)
+        except Exception:
+            if self.store.update_intent(spec.strategy_id):
+                self.store.update(spec.strategy_id,state='RECOVERING',detail='Coverage reduction requires KDF readback')
+            raise
+        self.store.set_update_intent_state(spec.strategy_id,'DONE')
+        self.store.update(spec.strategy_id,state='RUNNING',detail='Automatic quantity reduced for shared coverage',
+                          preview=json.dumps(preview.payload()),last_write=self.clock(),confirmations=0)
+        return True
+
+
+def vars_for_plan(plan):
+    from dataclasses import asdict
+    return asdict(plan)

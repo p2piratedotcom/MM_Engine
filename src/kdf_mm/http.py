@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from .http_diagnostics import RequestTrace, diagnostic_capture
 import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
@@ -86,13 +87,18 @@ class UrllibJsonTransport:
                 method=method, url=url, headers=headers, body=body,
                 total_timeout=min(timeout, total_timeout),
             ))
+        trace = RequestTrace()
         request = Request(url, data=body, headers=dict(headers or {}), method=method)
         phase = 'connect_or_headers'
         try:
             with _open(request, timeout=timeout) as response:
+                trace.fields["transport_http_status"] = getattr(response, "status", None)
+                trace.enter("response_body")
                 phase = 'response_body'
                 raw = response.read()
         except HTTPError as exc:
+            trace.fields["transport_http_status"] = exc.code
+            trace.enter("response_body")
             raw = exc.read()
             raise TransportError(
                 "remote API rejected the request",
@@ -100,11 +106,14 @@ class UrllibJsonTransport:
                 payload=_decode_payload(raw), kind="http_rejected", phase="response_headers",
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
+            trace.error(exc)
             # Do not include exception text: it may contain a signed URL/token.
             cause = getattr(exc, 'reason', exc)
             kind = 'timeout' if isinstance(cause, TimeoutError) else type(cause).__name__
             raise TransportError(f"remote API is unreachable ({kind})",
                                  kind=kind, phase=phase) from exc
+        finally:
+            trace.finish()
         return _decode_payload(raw)
 
     async def _request_with_deadline(
@@ -115,16 +124,19 @@ class UrllibJsonTransport:
         # aiohttp's total deadline includes both, even when the server stalls.
         import aiohttp
 
+        trace = RequestTrace()
         phase = 'connect_or_headers'
         try:
             deadline = aiohttp.ClientTimeout(total=total_timeout)
-            async with aiohttp.ClientSession(timeout=deadline) as session:
+            async with aiohttp.ClientSession(timeout=deadline, trace_configs=[trace.aiohttp_config()]) as session:
                 async with session.request(
                     method, url, headers=dict(headers or {}), data=body,
                     allow_redirects=False,
                     proxy=(None if _is_loopback(url) else _wallet_proxy_url)
                     if _wallet_proxy_configured else None,
                 ) as response:
+                    trace.fields["transport_http_status"] = getattr(response, "status", None)
+                    trace.enter("response_body")
                     phase = "response_body"
                     raw = await response.read()
                     if response.status >= 400 or 300 <= response.status < 400:
@@ -133,13 +145,19 @@ class UrllibJsonTransport:
                             status=response.status,
                             payload=_decode_payload(raw), kind="http_rejected", phase="response_headers",
                         )
+                    trace.enter("response_decode")
                     return _decode_payload(raw)
         except asyncio.TimeoutError as exc:
+            trace.error(exc)
             raise TransportError("remote API is unreachable (timeout)", kind="timeout", phase=phase) from exc
         except aiohttp.ClientError as exc:
+            trace.error(exc)
             raise TransportError(
                 f"remote API is unreachable ({type(exc).__name__})", kind=type(exc).__name__, phase=phase
             ) from exc
+
+        finally:
+            trace.finish()
 
 
 def _decode_payload(raw: bytes) -> Any:

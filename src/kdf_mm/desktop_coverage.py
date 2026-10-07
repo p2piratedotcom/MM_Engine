@@ -6,6 +6,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Protocol
 
 from .coverage import build_coverage_envelope
+from .network_diagnostics import emit as diagnostic
+from uuid import uuid4
 from .mexc import MexcError
 from .exchanges import load_config
 from .venues import coverage_asset_key, market_data_key, normalize_cex
@@ -103,12 +105,21 @@ class DesktopCoveragePublisher:
 
     def _stage(self, name, callback):
         started = time.monotonic()
+        identity = uuid4().hex
+        outcome, failure = 'received', None
+        diagnostic('coverage_stage_start', request_id=identity, phase=name)
         try:
             return callback()
         except Exception as exc:
+            outcome = 'error'
+            failure = getattr(exc, 'failure_kind', None) or 'stage_error'
+            diagnostic('coverage_publication_hold', request_id=identity, phase=name, outcome='error',
+                       reason='renewal_failed')
             raise CoveragePublisherError(f"rinnovo copertura, fase {name}: {exc}") from exc
         finally:
             self.timings_ms[name] = round((time.monotonic() - started) * 1000, 2)
+            diagnostic('coverage_stage_end', request_id=identity, phase=name, outcome=outcome,
+                       failure_kind=failure, elapsed_ms=self.timings_ms[name])
 
     def publish_once(self) -> CoveragePublishResult:
         self.timings_ms = {}

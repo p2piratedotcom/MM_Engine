@@ -35,6 +35,7 @@ def build_ideal(rows, quotes, fee):
     makers, targets, missing_valuation = [], defaultdict(D), []
     for row in rows:
         spec = StrategySpec.from_payload(row['spec'])
+        if not spec.hedging_enabled: continue
         quote = quotes.get(spec.strategy_id, {})
         preview = row.get('preview', {}).get('plan', {})
         if (preview.get('kdf_base'),preview.get('kdf_rel'))!=(spec.sold.ticker,spec.bought.ticker):
