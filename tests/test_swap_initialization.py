@@ -185,7 +185,7 @@ class InitializationTests(TestCase):
         service.orders_for = Mock(return_value=(self.order,))
         spec = SimpleNamespace(strategy_id="s", market_id=self.order.market_id, side=self.order.dex_side)
         service._cycle(spec, {})
-        service.controller._assert_market_fresh.assert_called_once()
+        service.controller._assert_quote_market_fresh.assert_called_once_with(self.order)
         service.controller._assert_pool_capacity.assert_called_once()
         service.controller.coverage_requirements.assert_called_once()
         service.controller.update_owned_quote.assert_not_called()
