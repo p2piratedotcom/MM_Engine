@@ -127,7 +127,7 @@ class WalletRebalance:
                 context = self._context(include_wallet=False)
                 opened = {q['strategy_id'] for q in context['open_quotes'] if q['cex']==venue}
                 others = {r['id'] for r in context['strategies'] if r['spec']['cex']==venue
-                    and r['state']!='DELETED' and r['id'] not in ids and (r['enabled'] or r['id'] in opened)}
+                    and r['spec'].get('hedging_enabled',True) and r['state']!='DELETED' and r['id'] not in ids and (r['enabled'] or r['id'] in opened)}
                 context['protected_ideal'] = self._local_ideal(venue,others) if others else None
                 return context
             api = _LocalContext(read)
@@ -162,7 +162,7 @@ class WalletRebalance:
             venue = normalize_cex(payload.get('venue'))
             context = self._context(include_wallet=False)
             candidates = {r['id']: r for r in context['strategies']
-                if r['spec']['cex'] == venue and r['state'] != 'DELETED'}
+                if r['spec']['cex'] == venue and r['spec'].get('hedging_enabled',True) and r['state'] != 'DELETED'}
             supplied = payload.get('strategy_ids')
             if supplied is None:
                 opened = {r['strategy_id'] for r in context['open_quotes'] if r['cex'] == venue}

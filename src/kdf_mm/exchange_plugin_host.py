@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import dataclasses
+from contextlib import nullcontext
 import importlib
 import json
 import sys
@@ -104,6 +105,10 @@ def main():
     while True:
         line = sys.stdin.buffer.readline(MAX_FRAME + 1)
         if not line:
+            close = getattr(route, "close_transports", None)
+            if callable(close):
+                try: close()
+                except Exception: pass
             return 0
         if len(line) > MAX_FRAME or not line.endswith(b"\n"):
             return 2
@@ -111,6 +116,13 @@ def main():
         identity = request.get("id")
         method = request.get("method")
         started = time.monotonic()
+        cpu_started, process_cpu_started = time.thread_time(), time.process_time()
+        transport_records = []
+        def measurements():
+            return {"adapter_ms": round((time.monotonic()-started)*1000, 2),
+                    "adapter_thread_cpu_ms": round((time.thread_time()-cpu_started)*1000, 2),
+                    "adapter_process_cpu_ms": round((time.process_time()-process_cpu_started)*1000, 2),
+                    "transport_records": transport_records}
         try:
             if type(identity) is not int or method not in METHODS:
                 raise ValueError("invalid protocol request")
@@ -131,9 +143,17 @@ def main():
                 from cex_plugin.models import HedgeSide
 
                 keywords["side"] = HedgeSide(keywords["side"])
-            result = getattr(client, method)(*arguments, **keywords)
-            reply({"id": identity, "result": encode(result),
-                   "adapter_ms": round((time.monotonic()-started)*1000, 2)})
+            capture = getattr(route, "diagnostic_capture", None)
+            progress_count = 0
+            def progress(phase):
+                nonlocal progress_count
+                if progress_count >= 64:
+                    return
+                progress_count += 1
+                reply({"id": identity, "diagnostic_phase": phase})
+            with capture(progress=progress) if callable(capture) else nullcontext([]) as transport_records:
+                result = getattr(client, method)(*arguments, **keywords)
+            reply({"id": identity, "result": encode(result), **measurements()})
         except Exception as exc:
             # Never send raw remote errors, signed URLs or API credentials.
             code = getattr(exc, "payload", None)
@@ -144,7 +164,7 @@ def main():
             reply(
                 {
                     "id": identity,
-                    "adapter_ms": round((time.monotonic()-started)*1000, 2),
+                    **measurements(),
                     "error": {
                         "status": status if type(status) is int else None,
                         "code": code,

@@ -149,7 +149,7 @@ def handler_factory(
 
     # Persist one read-only display lane for all wallet balance HTTP requests.
     from .exchanges.balances import PreviewBalances
-    from .credentials import LinuxSecretService
+    from .credentials import LinuxSecretService, SecretServiceError
     display_balances = PreviewBalances(
         keyring_factory=lambda: LinuxSecretService(profile=cex_profile)) if wallet_mode else None
 
@@ -176,6 +176,7 @@ def handler_factory(
                                  "kdf_owner": "wallet", "venues": list(supported_venues()),
                                  "plugin_protocol": 1,
                                  "plugins_external": installed_plugins() is not None,
+                                 "optional_hedging": 1, "shared_coverage": 1,
                                  "rebalance": wallet_rebalance is not None,
                                  "rebalance_selection": 1 if wallet_rebalance is not None else 0,
                                  "rebalance_ideal": wallet_rebalance is not None,
@@ -183,7 +184,7 @@ def handler_factory(
             elif path == "/v1/exchanges/balances" and wallet_mode:
                 try:
                     from .exchanges.balances import PreviewBalances
-                    from .credentials import LinuxSecretService
+                    from .credentials import LinuxSecretService, SecretServiceError
                     from .venues import normalize_cex
                     venue = normalize_cex(parse_qs(urlparse(self.path).query).get("venue", ["MEXC"])[0])
                     balances = display_balances.read_account(venue)
@@ -860,6 +861,7 @@ def build_controller(
         mexc_quote_asset=settings.mexc_quote_asset,
         coverage=coverage,
     )
+    controller.shared_hedge_journal = settings.desktop_journal_db
     controller.rebalance_lock_path = str(Path(settings.desktop_journal_db).resolve()) + ".rebalance.lock"
     return controller
 
@@ -969,7 +971,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
     if isinstance(public_feed, MexcPublicFeedGroup):
         public_feed.set_sample_sink(strategy_store.record_market_book_sample)
     from .exchanges.balances import PreviewBalances
-    from .credentials import LinuxSecretService
+    from .credentials import LinuxSecretService, SecretServiceError
     preview_balances = PreviewBalances(
         keyring_factory=lambda: LinuxSecretService(profile=mexc_profile),
         base_urls={"MEXC": settings.mexc_base_url, "GATE": settings.gate_base_url},
@@ -1093,10 +1095,13 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
     shutdown_report: dict[str, object] = {"orders_remaining": 0, "cancel_error": None}
     try:
         if with_mexc:
-            local_mexc = LocalMexcWorker(
-                replace(settings, agent_token=worker_token) if worker_token else settings,
-                profile=mexc_profile)
-            local_mexc.start()
+            try:
+                local_mexc = LocalMexcWorker(
+                    replace(settings, agent_token=worker_token) if worker_token else settings,
+                    profile=mexc_profile)
+                local_mexc.start()
+            except SecretServiceError:
+                print('CEX worker unavailable: configure credentials before starting hedged makers',file=sys.stderr)
         if public_feed is not None:
             if isinstance(public_feed, MexcPublicFeedGroup):
                 public_feed.set_active_symbols(

@@ -178,6 +178,7 @@ class MexcPublicFeed:
             "asks": [[str(level.price), str(level.quantity)] for level in book.asks],
             "base_volume_24h": str(volume),
             "volume_observed_at_ms": ticker['_observed_at_ms'],
+            "volume_known": ticker['_observed_at_ms'] is not None,
             "buy_capacity_arrr": str(
                 sum((level.quantity for level in book.asks), start=Decimal("0"))
             ),
@@ -290,6 +291,10 @@ class MexcPublicFeed:
             return rules
 
     def _ticker_24h(self, deadline: float) -> Mapping[str, Any]:
+        if getattr(self.store,'price_reference_only',False):
+            with self._lock:
+                # Missing volume is explicit; no invented observation timestamp.
+                return self._ticker or {'volume':'0','_observed_at_ms':None}
         # The rolling 24h volume changes much more slowly than the order book.
         # Avoid an extra remote request on every 3-second depth refresh while
         # never using a cached volume older than 15 seconds for a new quote.
@@ -303,7 +308,8 @@ class MexcPublicFeed:
         if running:
             # Do not block depth behind a slow metadata refresh or renew the
             # book timestamp using volume that has exceeded its original TTL.
-            raise MexcPublicFeedError(f"{self.venue} rolling-volume data is unavailable or expired")
+            if not getattr(self.store,"price_reference_only",False) or self._ticker is None:
+                raise MexcPublicFeedError(f"{self.venue} rolling-volume data is unavailable or expired")
         return self._refresh_ticker(deadline)
 
     def _refresh_ticker(self, deadline):

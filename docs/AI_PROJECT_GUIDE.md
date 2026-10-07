@@ -181,6 +181,12 @@ license is Unlicense; bundled dependencies retain their own notices.
 Use [NETWORK_DIAGNOSTICS.md](NETWORK_DIAGNOSTICS.md) and
 [FEED_RPC_RECOVERY.md](FEED_RPC_RECOVERY.md). Only allowlisted method/PID/request ID,
 timestamps, durations, stage/route, outcomes and statuses belong in network logs.
+The optional HTTP phase/host lifecycle extension and sparse incident journals
+are documented there with their compatibility and retained-history limits.
+The companion universal CEX HTTP core (MEXC 0.1.3, other adapters 0.1.1) measures
+resolver queue separately from OS resolution and reuses explicitly routed
+sessions/connections. Passive `network_path_sample` (`network_path.py`) correlates
+link counters, with explicit unavailable/causality limits.
 No keys, tokens, URL/header/body dumps, account data or raw exceptions. Preserve
 mode 0600, bounds/rotation and `dropped_records` accounting.
 
@@ -240,3 +246,13 @@ modules/contracts, proposed change, risks, exact checks actually performed,
 checks not run, companion repositories affected, and guide sections updated.
 Implementation, fixture tests, a compatible release, installation, startup,
 read-only account validation and funded acceptance are separate milestones.
+
+
+## Optional hedging / shared funding candidate
+
+See [OPTIONAL_HEDGING_SHARED_COVERAGE.md](OPTIONAL_HEDGING_SHARED_COVERAGE.md)
+for immutable creation choices, migration defaults, public-price-only maker
+flows, UUID/intent/swap reservations, selective safety reductions and attribution
+of stale/unknown funds. `optional_hedging: 1` and `shared_coverage: 1` are additive
+capabilities. Native KDF is unchanged. Rebalance snapshot/custom/live execution
+is not implemented by this candidate; only eligibility compatibility is added.

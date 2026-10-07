@@ -148,6 +148,9 @@ class SpotPluginClient:
             bufsize=0,
             env=environment,
         )
+        from ..network_diagnostics import emit as diagnostic
+        diagnostic("plugin_lifecycle", venue=self.item["venue"], plugin_pid=self._process.pid,
+                   phase="spawn", outcome="started")
         self._buffer = b""
         os.set_blocking(self._process.stdin.fileno(), False)
         bootstrap = dict(
@@ -213,6 +216,10 @@ class SpotPluginClient:
             metrics = dict(queue_ms=round((time.monotonic()-started)*1000, 2))
             phase, outcome, failure_kind, status = 'startup', 'received', None, None
             adapter_ms, unknown = None, False
+            plugin_pid = None
+            transport_records = []
+            transport_phase = None
+            transport_phase_received = None
             try:
                 stage = time.monotonic()
                 try:
@@ -221,6 +228,7 @@ class SpotPluginClient:
                         self._start()
                 finally:
                     metrics['startup_ms'] = round((time.monotonic()-stage)*1000, 2)
+                plugin_pid = self._process.pid
                 self._sequence += 1
                 timeout = (kwargs.get("total_timeout") or kwargs.get("timeout")
                            or self.options["timeout"])
@@ -232,13 +240,42 @@ class SpotPluginClient:
                 metrics['send_ms'] = round((time.monotonic()-stage)*1000, 2)
                 phase, stage = 'reply_wait', time.monotonic()
                 try:
-                    response = self._read(time.monotonic()+budget)
+                    reply_deadline = time.monotonic()+budget
+                    # Optional host phase frames share the original deadline.
+                    # They cannot extend a request or contain payloads.
+                    for _ in range(128):
+                        response = self._read(reply_deadline)
+                        if isinstance(response, dict) and set(response) == {'id', 'diagnostic_phase'}:
+                            if response['id'] != self._sequence or response['diagnostic_phase'] not in {
+                                'connect_or_headers', 'connect_tls', 'dns', 'request_send',
+                                'headers_wait', 'response_body', 'response_decode', 'connection_queue'}:
+                                raise ValueError('invalid plugin diagnostic frame')
+                            transport_phase = response['diagnostic_phase']
+                            transport_phase_received = time.monotonic()
+                            continue
+                        break
+                    else:
+                        raise ValueError('too many plugin diagnostic frames')
                 finally:
                     metrics['reply_wait_ms'] = round((time.monotonic()-stage)*1000, 2)
                 phase = 'decode'
                 if not isinstance(response, dict) or response.get("id") != self._sequence:
                     raise ValueError("invalid plugin response identity")
                 adapter_ms = response.get('adapter_ms')
+                from ..network_diagnostics import NUMBER
+                for metric in ('adapter_thread_cpu_ms', 'adapter_process_cpu_ms'):
+                    if type(response.get(metric)) in (int, float):
+                        metrics[metric] = response[metric]
+                raw_records = response.get('transport_records', [])
+                if isinstance(raw_records, list):
+                    # Never forward URLs, headers, bodies or account fields.
+                    allowed = {'transport_phase', 'transport_failure', 'session_reused',
+                               'connection_reused', 'dns_cache_hit', 'resolver_inflight',
+                               'resolver_queue_ms', 'resolver_call_ms'} | {k for k in NUMBER if
+                        k not in {'http_sequence'} and k.startswith(('http_', 'transport_', 'dns_', 'connect_', 'connection_',
+                                      'request_send_', 'headers_wait_', 'response_body_', 'response_decode_'))}
+                    transport_records = [{k:v for k,v in row.items() if k in allowed}
+                                         for row in raw_records[:8] if isinstance(row, dict)]
                 if "error" in response:
                     phase = 'adapter'
                     error = response["error"]
@@ -274,8 +311,17 @@ class SpotPluginClient:
                 exc.phase = phase
                 raise exc from None
             finally:
+                for index, transport in enumerate(transport_records, 1):
+                    diagnostic('http_request_end', request_id=identity, venue=self.item['venue'],
+                               method=method, plugin_pid=plugin_pid, http_sequence=index,
+                               lane='private' if self.options['api_key'] else 'public',
+                               route='tor' if http._wallet_proxy_url is not None else 'direct', **transport)
                 diagnostic('plugin_request_end', request_id=identity, venue=self.item['venue'],
                            symbol=symbol, method=method, phase=phase, outcome=outcome,
+                           plugin_pid=plugin_pid, protocol_sequence=self._sequence,
+                           transport_phase=transport_phase,
+                           transport_phase_elapsed_ms=(round((time.monotonic()-transport_phase_received)*1000, 2)
+                               if transport_phase_received is not None else None),
                            failure_kind=failure_kind, http_status=status, adapter_ms=adapter_ms,
                            execution_unknown=unknown, lane='private' if self.options['api_key'] else 'public',
                            route='tor' if http._wallet_proxy_url is not None else 'direct',
@@ -297,6 +343,9 @@ class SpotPluginClient:
         process, self._process = self._process, None
         if process is None:
             return
+        from ..network_diagnostics import emit as diagnostic
+        diagnostic("plugin_lifecycle", venue=self.item["venue"], plugin_pid=process.pid,
+                   phase="close", outcome="closing", plugin_exit_code=process.poll())
         process.stdin.close()
         try:
             process.wait(timeout=1)
@@ -308,6 +357,8 @@ class SpotPluginClient:
                 process.kill()
                 process.wait(timeout=1)
         process.stdout.close()
+        diagnostic("plugin_lifecycle", venue=self.item["venue"], plugin_pid=process.pid,
+                   phase="exit", outcome="stopped", plugin_exit_code=process.returncode)
 
 
 def client_for(item, **kwargs):

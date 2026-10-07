@@ -47,6 +47,8 @@ class OwnedOrder:
     # liquidity-multiplier allocation is not mistaken for a smaller quote.
     kdf_max_volume: Decimal = Decimal("0")
     kdf_min_volume: Decimal = Decimal("0")
+    hedging_enabled: bool = True
+    market_reference_required: bool = True
 
     @property
     def advertised_volume(self) -> Decimal:
@@ -107,6 +109,15 @@ class OrderOwnershipStore:
         for name in ('reason_source', 'strategy_id'):
             if name not in columns:
                 self.connection.execute(f"ALTER TABLE owned_orders ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+        for name in ('hedging_enabled', 'market_reference_required'):
+            if name not in columns:
+                self.connection.execute(f"ALTER TABLE owned_orders ADD COLUMN {name} INTEGER NOT NULL DEFAULT 1")
+        self.connection.executescript("""
+            CREATE TRIGGER IF NOT EXISTS owned_protection_immutable
+            BEFORE UPDATE OF hedging_enabled,market_reference_required ON owned_orders
+            WHEN NEW.hedging_enabled != OLD.hedging_enabled OR NEW.market_reference_required != OLD.market_reference_required
+            BEGIN SELECT RAISE(ABORT,'Immutable maker UUID protection policy'); END;
+        """)
         # Append-only audit. Triggers make state and its event one atomic write,
         # including publications and state changes discovered by reconciliation.
         self.connection.executescript("""
@@ -234,6 +245,8 @@ class OrderOwnershipStore:
     def register(
         self, order_uuid: str, plan: QuotePlan, *, min_volume: Decimal | None = None,
     ) -> OwnedOrder:
+        if type(plan.hedging_enabled) is not bool or type(plan.market_reference_required) is not bool:
+            raise ValueError("Invalid immutable maker protection policy")
         if not order_uuid:
             raise ValueError("order_uuid is required")
         with self._lock:
@@ -251,6 +264,7 @@ class OrderOwnershipStore:
                     plan.market_id or _market_id(plan.dex_side, plan.kdf_base, plan.kdf_rel),
                     plan.inventory_pool or plan.kdf_base,
                     min_volume or Decimal("0"),
+                    plan.hedging_enabled, plan.market_reference_required,
                 )
                 actual = (
                     existing.dex_side,
@@ -261,6 +275,7 @@ class OrderOwnershipStore:
                     existing.market_id,
                     existing.inventory_pool,
                     existing.kdf_min_volume,
+                    existing.hedging_enabled, existing.market_reference_required,
                 )
                 if actual != expected:
                     raise OrderOwnershipConflict(
@@ -272,8 +287,8 @@ class OrderOwnershipStore:
                 INSERT INTO owned_orders
                     (order_uuid, dex_side, kdf_base, kdf_rel,
                      kdf_price, kdf_volume, status, market_id, inventory_pool,
-                     kdf_max_volume, kdf_min_volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     kdf_max_volume, kdf_min_volume, hedging_enabled, market_reference_required)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_uuid,
@@ -287,6 +302,7 @@ class OrderOwnershipStore:
                     plan.inventory_pool or plan.kdf_base,
                     str(plan.kdf_volume),
                     str(min_volume or Decimal("0")),
+                    int(plan.hedging_enabled), int(plan.market_reference_required),
                 ),
             )
         order = self.get(order_uuid)
@@ -878,6 +894,8 @@ class OrderOwnershipStore:
             inventory_pool=row["inventory_pool"],
             kdf_max_volume=Decimal(row["kdf_max_volume"] or row["kdf_volume"]),
             kdf_min_volume=Decimal(row["kdf_min_volume"] or "0"),
+            hedging_enabled=bool(row["hedging_enabled"]),
+            market_reference_required=bool(row["market_reference_required"]),
         )
 
     @staticmethod

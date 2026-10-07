@@ -123,14 +123,17 @@ class StrategySpec:
     scale_group: str = ""
     auto_fraction: Decimal = D("1")
     cex: str = "MEXC"
+    hedging_enabled: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.hedging_enabled) is not bool:
+            raise ValueError("hedging_enabled must be a boolean")
         object.__setattr__(self, "cex", normalize_cex(self.cex))
         if not self.auto_fraction.is_finite() or not ZERO < self.auto_fraction <= 1:
             raise ValueError("percentuale custom auto: maggiore di 0 e al massimo 100%")
         if not self.strategy_id or len(self.strategy_id) > 100:
             raise ValueError("identificativo strategia richiesto (max 100 caratteri)")
-        if self.base.asset == "USDT" or self.base.asset == self.quote.asset:
+        if (self.base.asset == "USDT" or self.base.asset == self.quote.asset) and self.requires_reference:
             raise ValueError("base non-USDT e asset distinti richiesti")
         if self.base.ticker == self.quote.ticker:
             raise ValueError("coin distinte richieste")
@@ -159,6 +162,10 @@ class StrategySpec:
             raise ValueError("impatto massimo 1%; quota di profondità massima 50%")
         if self.confirmations < 3 or self.update_seconds < 1:
             raise ValueError("almeno 3 snapshot e intervallo positivo richiesti")
+
+    @property
+    def requires_reference(self):
+        return self.hedging_enabled or self.price_mode == "auto"
 
     @property
     def market_id(self) -> str:
@@ -201,16 +208,19 @@ class StrategyPreview:
 
     def payload(self) -> dict[str, Any]:
         return {
-            "plan": {k: str(v) for k, v in asdict(self.plan).items()},
+            "plan": {k: v if type(v) is bool else str(v) for k, v in asdict(self.plan).items()},
+            "hedging_enabled": self.plan.hedging_enabled,
             "caps_sold": {k: str(v) for k, v in self.caps_sold.items()},
             "hedge_legs": list(self.hedge_legs),
             "evidence": self.evidence,
             "valuations_usdt": {k: str(v) for k, v in self.valuations_usdt.items()},
-            "reference_type": "BEST_EXECUTABLE_BID_ASK",
+            "reference_type": ("FIXED_KDF_PRICE" if not self.plan.market_reference_required else
+                               "CEX_PRICE_ONLY" if not self.plan.hedging_enabled else "BEST_EXECUTABLE_BID_ASK"),
             "quantity_policy": self.quantity_policy,
             "price_unit": f"{self.plan.quote_currency}/{self.plan.base_ticker}",
             "quantity_unit": self.plan.kdf_base,
-            "notice": "Limite stimato dallo snapshot, non garanzia di liquidità futura. USDT non equivale necessariamente a USD.",
+            "notice": ("No hedging: swaps change wallet inventory without a compensating CEX trade." if not self.plan.hedging_enabled else
+                       "Limite stimato dallo snapshot, non garanzia di liquidità futura. USDT non equivale necessariamente a USD."),
         }
 
 
@@ -244,6 +254,10 @@ def preview_strategy(
     A fixed quantity is all-or-nothing. No hidden shrinking. All balances must
     be NET of other strategies, active swaps and gas reserves by the caller.
     """
+    if not spec.hedging_enabled:
+        return preview_unhedged(spec, snapshots, kdf_free=kdf_free,
+                                remaining_budget=remaining_budget, daily_remaining=daily_remaining,
+                                diagnostics_only=diagnostics_only)
     for value, label in ((kdf_free, "saldo KDF"), (fee, "commissione"), (buffer, "buffer"),
                          (daily_volume_fraction, "frazione volume giornaliero")):
         number(value, label, positive=False)
@@ -420,3 +434,55 @@ def limit_description(key):
     return {'percentuale_auto': 'Quantità scelta con la percentuale custom auto',
             'KDF_disponibile': 'Saldo KDF residuo', 'limite_utente': 'Massimo impostato',
             'budget_residuo': 'Budget residuo', 'limite_24h_residuo': 'Limite giornaliero residuo'}.get(key, key)
+
+
+
+def preview_unhedged(spec, snapshots, *, kdf_free, remaining_budget=None,
+                      daily_remaining=None, diagnostics_only=False):
+    """DEX-only capacity. Public books are used solely for automatic pricing."""
+    number(kdf_free, 'KDF spendable capacity', positive=False)
+    sell_base = spec.side is DexSide.SELL_ARRR
+    reference = spec.fixed_price
+    if spec.price_mode == 'auto':
+        books = {r.symbol: snapshots[r.symbol].order_book() for r in (spec.base, spec.quote) if r.symbol}
+        if any(not x.bids or not x.asks or x.bids[0].price >= x.asks[0].price for x in books.values()):
+            raise ValueError('Price reference is empty or crossed')
+        base = books[spec.base.symbol]
+        bp = base.asks[0].price if sell_base else base.bids[0].price
+        qp = ONE
+        if spec.quote.symbol:
+            book = books[spec.quote.symbol]
+            qp = book.bids[0].price if sell_base else book.asks[0].price
+        reference = bp / qp
+    price = reference * (ONE+spec.premium) if spec.price_mode == 'auto' else spec.fixed_price
+    number(price, 'DEX price')
+    rate = price if sell_base else ONE/price
+    caps = {'KDF_disponibile': kdf_free,
+            'limite_utente': spec.max_sold,
+            'budget_residuo': remaining_budget if remaining_budget is not None else
+                              (None if spec.replenish else spec.total_sold_budget),
+            'limite_24h_residuo': daily_remaining if daily_remaining is not None else spec.daily_sold_cap}
+    caps = {k:v for k,v in caps.items() if v is not None}
+    maximum = min(caps.values())
+    if spec.quantity_mode == 'auto': maximum *= spec.auto_fraction
+    maximum = max(ZERO, maximum).quantize(D('.00000001'), rounding=ROUND_DOWN)
+    quantity = spec.fixed_sold if spec.quantity_mode == 'fixed' else maximum
+    if diagnostics_only:
+        return {'cex':spec.cex,'hedging_enabled':False,'maximum':str(maximum),'minimum':'0',
+                'feasible_maximum':str(maximum),'coin':spec.sold.ticker,'funds':[],
+                'limiting':[k for k,v in caps.items() if v == min(caps.values())],
+                'limits':{k:str(v) for k,v in caps.items()}}
+    if quantity is None or quantity <= 0 or quantity > min(caps.values()):
+        raise ValueError(f'Insufficient KDF funds or maker budget; maximum {maximum} {spec.sold.ticker}')
+    if quantity != quantity.quantize(D('.00000001'), rounding=ROUND_DOWN):
+        raise ValueError('Maker quantity must be representable with eight decimals')
+    plan = QuotePlan(spec.side, HedgeSide.BUY if sell_base else HedgeSide.SELL,
+        quantity if sell_base else quantity/price, reference, reference, price,
+        spec.sold.ticker, spec.bought.ticker, rate, quantity,
+        spec.premium if spec.price_mode == 'auto' else ZERO,
+        spec.market_id, spec.quote.ticker, spec.sold.ticker, spec.base.ticker,
+        spec.premium, ZERO, ZERO, hedging_enabled=False,
+        market_reference_required=spec.price_mode == 'auto')
+    evidence = tuple(sorted((key, snap.sequence) for key,snap in snapshots.items()))
+    return StrategyPreview(plan,caps,(),evidence,{},
+                           'fixed' if spec.quantity_mode == 'fixed' else 'auto from KDF funds')

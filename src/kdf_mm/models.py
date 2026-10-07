@@ -135,6 +135,14 @@ class QuotePlan:
     cex_taker_fee: Decimal = ZERO
     risk_buffer: Decimal = ZERO
     strategy_id: str = ""
+    hedging_enabled: bool = True
+    market_reference_required: bool = True
+
+    def __post_init__(self):
+        if type(self.hedging_enabled) is not bool or type(self.market_reference_required) is not bool:
+            raise ValueError('Maker protection flags must be boolean')
+        if self.hedging_enabled and not self.market_reference_required:
+            raise ValueError('Hedged makers require a fresh market reference')
 
     @property
     def base_quantity(self) -> Decimal:

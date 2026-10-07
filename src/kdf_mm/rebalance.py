@@ -428,6 +428,7 @@ def _venue_context(context, venue, fee):
     result['strategies'] = [
         row for row in context.get('strategies', [])
         if str(row.get('spec', {}).get('cex', 'MEXC')).upper() == selected
+        and row.get('spec',{}).get('hedging_enabled',True)
     ]
     result['fee'] = str(fee)
     result['venue'] = selected
