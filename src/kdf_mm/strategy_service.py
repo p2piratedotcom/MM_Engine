@@ -395,6 +395,8 @@ class StrategyService:
         free = {a: D(v) for a, v in coverage["free_balances"].items()}
         excluded = set(exclude_many) | {exclude}
         needed = {}
+        maker_needed = {}
+        maker_ids = {}
         reserved = {}
         active = [o for o in self.reservation_orders() if o.order_uuid not in excluded]
         for order in active:
@@ -409,6 +411,19 @@ class StrategyService:
                 continue
             for asset, amount in requirement.items():
                 needed[asset] = needed.get(asset, D(0)) + amount
+        # Attribute only established maker obligations to the maker count.
+        # Swap holds, uncertain publications and update high-water increments
+        # remain in the separate pending-operations amount.
+        for order in c.ownership.active():
+            if order.order_uuid in excluded or getattr(order, "reservation_kind", None) == "swap":
+                continue
+            requirement = self.coverage_requirement(order, check_depth=False)
+            if requirement is None:
+                continue  # Legacy obligations remain unattributed, never guessed.
+            for asset, amount in requirement.items():
+                if amount > 0:
+                    maker_needed[asset] = maker_needed.get(asset, D(0)) + amount
+                    maker_ids.setdefault(asset, set()).add(order.order_uuid)
         def lookup(item):
             return next((s for s in extra_specs if s.strategy_id == getattr(item, "strategy_id", "")), None) or self._for_quote(item)
         for item in (*active, *extra):
@@ -430,6 +445,17 @@ class StrategyService:
                 raise ValueError("route della strategia opposta non disponibile")
             for asset, amount in required.items():
                 needed[asset] = needed.get(asset, D(0)) + amount
+        funding_context = {}
+        for asset in {"USDT", spec.base.asset, spec.quote.asset}:
+            key = self._coverage_key(spec, asset)
+            total = needed.get(key, D(0))
+            makers = min(total, maker_needed.get(key, D(0)))
+            funding_context[asset] = {
+                "free_balance": str(free.get(key, D(0))),
+                "maker_reserved": str(makers),
+                "maker_count": len(maker_ids.get(key, set())),
+                "other_reserved": str(max(D(0), total - makers)),
+            }
         free = {asset: max(D(0), amount - needed.get(asset, D(0))) for asset, amount in free.items()}
         free = {asset: free.get(self._coverage_key(spec, asset), D(0))
                 for asset in {"USDT", spec.base.asset, spec.quote.asset}}
@@ -454,7 +480,8 @@ class StrategyService:
         preview = preview_strategy(sizing_spec, snapshots, kdf_free=max(D(0), maximum - committed), cex_free=free,
                                 remaining_budget=remaining, daily_remaining=daily, fee=self._fee(spec),
                                 buffer=c.risk_buffer, daily_volume_fraction=c.max_daily_volume_fraction,
-                                reserved_hedges=venue_reserved, diagnostics_only=diagnostics_only)
+                                reserved_hedges=venue_reserved, diagnostics_only=diagnostics_only,
+                                funding_context=funding_context)
         if diagnostics_only:
             return preview
         return replace(preview, plan=replace(preview.plan, strategy_id=spec.strategy_id))

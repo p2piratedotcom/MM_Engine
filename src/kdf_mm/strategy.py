@@ -248,6 +248,7 @@ def preview_strategy(
     reserved_hedges: Mapping[tuple[str, str], Decimal] | None = None,
     diagnostics_only: bool = False,
     funding_target: bool = False,
+    funding_context: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> StrategyPreview | dict[str, Any]:
     """Size both hedge legs in their actual units, with 50% book headroom.
 
@@ -343,10 +344,15 @@ def preview_strategy(
               'feasible_maximum': str(precision_maximum if precision_maximum >= minimum else ZERO),
               'coin': spec.sold.ticker, 'limiting': limiting, 'funds': shortages,
               'quantity_for_funds': str(requested),
+              'funding_context': dict(funding_context or {}),
               'limits': {key: str(value) for key, value in caps.items()},
               'snapshot_ms': min(s.observed_at_ms for s in snapshots.values())}
     if diagnostics_only:
         return report
+    if (not funding_target and any(D(row['missing']) > ZERO for row in shortages)
+            and (desired is None or desired <= 0 or desired > allowed or desired < minimum)):
+        raise ValueError(funding_explanation(spec, shortages, funding_context or {},
+                                            requested, desired, minimum, maximum, limiting))
     if not funding_target and (desired is None or desired <= 0 or desired > allowed):
         title = "quantità fissa non coperta" if spec.quantity_mode == "fixed" else "nessuna quantità coperta disponibile"
         reasons = []
@@ -421,6 +427,75 @@ def preview_strategy(
     policy = ('fixed' if spec.quantity_mode == 'fixed' else
               f'custom auto {(spec.auto_fraction * 100).normalize():f}%' if spec.auto_fraction < 1 else 'max auto')
     return StrategyPreview(plan, caps, tuple(payload_legs), evidence, valuations, policy)
+
+
+def funding_limit_label(key, venue):
+    labels = {
+        'percentuale_auto': 'custom auto percentage',
+        'KDF_disponibile': 'remaining sellable KDF balance',
+        'limite_utente': 'maximum quantity setting',
+        'budget_residuo': 'remaining budget',
+        'limite_24h_residuo': 'remaining daily limit',
+    }
+    if key in labels:
+        return labels[key]
+    if key.startswith(f'{venue}_USDT_per_'):
+        return f"available USDT to buy {key.removeprefix(venue + '_USDT_per_')} on {venue}"
+    if key.startswith(f'{venue}_'):
+        return f"available {key[len(venue) + 1:]} on {venue}"
+    if key.endswith('_profondità_50%'):
+        side, asset, _ = key.split('_', 2)
+        return f"remaining {asset} {'buy' if side == 'BUY' else 'sell'} book depth within the allowed impact"
+    if key.endswith('_volume_24h'):
+        return f"{key.removesuffix('_volume_24h')} rolling 24-hour volume limit"
+    if key.startswith('precisione_hedge_'):
+        return f"hedge quantity precision on {venue}"
+    return 'another configured quantity limit'
+
+
+def funding_explanation(spec, rows, context, evaluated, desired, minimum, maximum, limiting):
+    """Presentation only: preserve exact amounts and all sizing/hold guards."""
+    missing_assets = ', '.join(r['asset'] for r in rows if D(r['missing']) > ZERO)
+    lines = [f"Insufficient {missing_assets} coverage on {spec.cex}",
+             f"{spec.sold.ticker} → {spec.bought.ticker}"]
+    for row in rows:
+        asset = row['asset']
+        details = context.get(asset)
+        lines.append('')
+        lines.append(f"{asset} on {spec.cex}")
+        if details is not None:
+            lines.append(f"Free exchange balance: {details['free_balance']} {asset}.")
+            count = int(details['maker_count'])
+            if count:
+                noun = 'maker order' if count == 1 else 'maker orders'
+                lines.append(f"{details['maker_reserved']} {asset} reserved to cover {count} existing {noun}.")
+            else:
+                lines.append(f"Reserved for existing maker orders: {details['maker_reserved']} {asset}.")
+            if D(details['other_reserved']) > ZERO:
+                lines.append(f"Other reservations (pending operations or unattributed obligations): {details['other_reserved']} {asset}.")
+        lines.append(f"Available for this maker: {row['available']} {asset}.")
+        lines.append(f"Required: {row['required']} {asset}. Missing: {row['missing']} {asset}.")
+        if D(row['missing']) == ZERO:
+            lines.append(f"{asset} coverage is sufficient for the evaluated quantity.")
+    basis = 'minimum hedge quantity' if evaluated == minimum and desired != minimum else 'requested quantity'
+    lines.extend(['', f"Funds above are calculated for the {basis}: {evaluated} {spec.sold.ticker}.",
+                  f"Requested preview quantity: {desired} {spec.sold.ticker}.",
+                  f"Minimum hedge quantity: {minimum} {spec.sold.ticker}.",
+                  f"Maximum allowed by current funds and limits: {maximum} {spec.sold.ticker}."])
+    if maximum < minimum:
+        lines.append("No valid hedge quantity is currently available: the maximum is below the minimum.")
+    if limiting:
+        lines.append("Current limiting constraints: " + ', '.join(funding_limit_label(key, spec.cex) for key in limiting) + '.')
+    lines.extend(['', 'Possible solutions:',
+                  f"• Increase the available {missing_assets} balance on {spec.cex}.",
+                  '• Choose another supported CEX with available funds and the required hedge markets.'])
+    if any(D(d.get('maker_reserved', '0')) > ZERO for d in context.values()):
+        lines.extend(['• Pause an existing maker, wait for its order withdrawal to be confirmed, then repeat the preview.',
+                      'Pausing releases coverage only after confirmed withdrawal, provided no swap or pending obligation still needs it.'])
+    if desired is not None and desired < minimum:
+        lines.append('The quantity must also reach the hedge minimum; increasing it alone does not resolve missing funds. Check quantity caps, budgets and any custom auto percentage.')
+    lines.append('Repeat the preview after making changes; funds, market depth and other limits will be checked again.')
+    return '\n'.join(lines)
 
 
 def funds_report(rows):
