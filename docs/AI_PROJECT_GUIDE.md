@@ -102,6 +102,16 @@ preview. Pause is not immediate release: withdrawal must be confirmed and swap/
 uncertain-operation obligations must be resolved. Increasing quantity alone does
 not cure a funding shortage. Minimums, depth, budgets and precision still apply.
 
+A non-funding capacity failure uses whole English messages too. For a limiting
+hedge book it separates visible depth within the price-impact bound, the usable
+fraction, other hedge reservations and the remaining quantity, in the actual
+hedge asset units. Zero residual depth is not proof of an empty exchange book.
+The funds check names its evaluated quantity; sufficient funds cannot repair a
+depth constraint. Suggested alternatives preserve impact/depth limits and require
+confirmed updates/withdrawals before assuming another maker releases capacity.
+Compact diagnostic display rounds to at most eight decimals with approximation
+markers; calculations and the additive `market_depth` report retain exact values.
+
 ### How to interpret state
 
 | Observation | Interpretation |
@@ -273,3 +283,7 @@ flows, UUID/intent/swap reservations, selective safety reductions and attributio
 of stale/unknown funds. `optional_hedging: 1` and `shared_coverage: 1` are additive
 capabilities. Native KDF is unchanged. Rebalance snapshot/custom/live execution
 is not implemented by this candidate; only eligibility compatibility is added.
+
+Below-minimum sizing uses the same capacity explanation and names the binding limits instead of giving a generic increase-quantity instruction. Auto-calculated quantities are explicitly distinguished from user-entered Fixed quantities. The funds check states its evaluated quantity; sufficient funds do not establish sufficient KDF balance, budget, depth or precision capacity.
+
+Safety cooldown copy uses whole English messages and minutes/seconds. It describes the earliest resumption of eligibility checks, not a promised republication time. Fresh market data, hedge funds/depth, venue minimums and all existing limits must still pass. Cooldown timing, stored source metadata, confirmation resets and manual-pause behavior are unchanged.

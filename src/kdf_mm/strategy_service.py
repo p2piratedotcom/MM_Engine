@@ -1514,9 +1514,16 @@ class StrategyService:
             cooldown = self.store.safety_cooldown(spec.strategy_id)
             if cooldown is not None and self.clock() < cooldown["resume_after"]:
                 seconds = int(cooldown["resume_after"] - self.clock()) + 1
+                minutes, remaining_seconds = divmod(seconds, 60)
+                wait = (f"{minutes} min {remaining_seconds} sec" if minutes else
+                        f"{remaining_seconds} sec")
                 self.store.update(spec.strategy_id, state="WAITING",
-                                  detail=f"ritiro di sicurezza ({cooldown['source']}): "
-                                         f"ripresa dopo {seconds} s e nuovi controlli {spec.cex}",
+                                  detail=("Order withdrawn for safety.\n"
+                                          f"Rechecks can resume in {wait}.\n"
+                                          f"The order will be republished only if fresh {spec.cex} checks confirm "
+                                          "valid market data, sufficient hedge funds and market depth, "
+                                          "and a quantity that meets the trading minimums and all current limits.\n"
+                                          "The countdown alone does not guarantee republication."),
                                   confirmations=0, evidence="null", preview="{}")
                 return
         preview = self._preview(spec, exclude=order.order_uuid if order else None)

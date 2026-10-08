@@ -291,6 +291,7 @@ def preview_strategy(
     }
     caps = {key: value for key, value in caps.items() if value is not None}
     legs = []
+    depth_details = []
     for route, side, units in ((spec.sold, HedgeSide.BUY, ONE), (spec.bought, HedgeSide.SELL, rate)):
         if route.symbol is None:
             continue
@@ -306,6 +307,15 @@ def preview_strategy(
                      (level.price <= boundary if side is HedgeSide.BUY else level.price >= boundary)), ZERO)
         reserved = (reserved_hedges or {}).get((route.symbol, side.value), ZERO)
         caps[f"{side.value}_{route.asset}_profondità_50%"] = max(ZERO, depth * spec.depth_fraction - reserved) / units
+        depth_details.append({
+            'asset': route.asset, 'side': side.value,
+            'visible_within_impact': str(depth),
+            'allowed_fraction': str(spec.depth_fraction),
+            'allowed_before_reservations': str(depth * spec.depth_fraction),
+            'reserved_for_other_hedges': str(reserved),
+            'remaining': str(max(ZERO, depth * spec.depth_fraction - reserved)),
+            'minimum_hedge_quantity_units': str(units),
+        })
         caps[f"{route.asset}_volume_24h"] = snap.base_volume_24h * daily_volume_fraction / units
         if side is HedgeSide.BUY:
             caps[f"{spec.cex}_USDT_per_{route.asset}"] = max(ZERO,
@@ -345,6 +355,7 @@ def preview_strategy(
               'coin': spec.sold.ticker, 'limiting': limiting, 'funds': shortages,
               'quantity_for_funds': str(requested),
               'funding_context': dict(funding_context or {}),
+              'market_depth': depth_details,
               'limits': {key: str(value) for key, value in caps.items()},
               'snapshot_ms': min(s.observed_at_ms for s in snapshots.values())}
     if diagnostics_only:
@@ -354,56 +365,37 @@ def preview_strategy(
         raise ValueError(funding_explanation(spec, shortages, funding_context or {},
                                             requested, desired, minimum, maximum, limiting))
     if not funding_target and (desired is None or desired <= 0 or desired > allowed):
-        title = "quantità fissa non coperta" if spec.quantity_mode == "fixed" else "nessuna quantità coperta disponibile"
-        reasons = []
-        for key, cap in caps.items():
-            if cap != allowed:
-                continue
-            if key.startswith("MEXC_USDT_per_"):
-                reasons.append(f"USDT Spot {spec.cex} netti disponibili: {cex_free.get('USDT', ZERO)} (necessari per comprare {spec.sold.asset})")
-            elif key.startswith("MEXC_"):
-                asset = key.removeprefix("MEXC_")
-                reasons.append(f"{asset} Spot {spec.cex} netti disponibili: {cex_free.get(asset, ZERO)} (necessari per vendere {asset} nella copertura)")
-            elif key == "KDF_disponibile":
-                reasons.append(f"saldo KDF vendibile residuo: {kdf_free} {spec.sold.ticker}; i livelli della stessa coppia si sommano, le coppie diverse condividono i fondi KDF")
-            else:
-                reasons.append(f"{limit_description(key)}: {cap} {spec.sold.ticker}")
-        suggestion = (f"Il passo di quantità {spec.cex} impedisce un hedge con residuo entro 0.01 USDT "
-                      "alla quantità disponibile; attendere più capacità o scegliere una route più precisa."
-                      if precision_maximum < minimum <= raw_maximum else
-                      f"Puoi provare al massimo {maximum} {spec.sold.ticker} con questo snapshot."
-                      if maximum > 0 and maximum >= minimum else
-                      f"Minimo copribile {spec.cex}: {minimum} {spec.sold.ticker}, superiore al massimo {maximum}. "
-                      "Nessuna quantità pubblicabile: ridurre l'importo non basta; attendere più liquidità o liberare/rifornire la risorsa limitante.")
-        raise ValueError(f"{spec.sold.ticker} → {spec.bought.ticker}: {title}. "
-                         + "; ".join(reasons) + f". Massimo coperto: {maximum} {spec.sold.ticker}. "
-                         + suggestion + ' ' + funds_report(shortages)
-                         + f" I saldi {spec.cex} sono al netto della copertura degli altri ordini.")
+        raise ValueError(capacity_explanation(spec, shortages, requested, desired,
+                                             minimum, maximum, limiting, depth_details))
     # Finite decimal KDF volume; sub-step hedge residuals are explicit and never
     # silently declared covered. The executor must account for every remainder.
     quantity = desired.quantize(D(".00000001"), rounding=ROUND_DOWN)
     if quantity <= 0 or (spec.quantity_mode == "fixed" and quantity != desired):
-        raise ValueError("quantità non rappresentabile (precisione massima 8 decimali)")
+        raise ValueError("Quantity cannot be represented with the maximum precision of 8 decimal places.")
     if precision_safe_sold_quantity(quantity, legs, books) != quantity:
         raise ValueError(
-            f"{spec.sold.ticker} → {spec.bought.ticker}: quantità non copribile con "
-            f"residuo di precisione {spec.cex} entro 0.01 USDT. "
-            "Ridurre la quantità o usare la modalità automatica."
+            f"{spec.sold.ticker} → {spec.bought.ticker}: the quantity cannot be hedged "
+            f"within the 0.01 USDT rounding-residual limit on {spec.cex}. "
+            "Reduce the quantity or use automatic sizing."
         )
     payload_legs = []
     for route, side, units, boundary, snap in legs:
         exact = quantity * units
         book = books[route.symbol]
         walk = walk_book(book.asks if side is HedgeSide.BUY else book.bids, exact)
-        if not funding_target and (not walk.complete or quantity < minimum):
-            raise ValueError(f"{spec.sold.ticker} → {spec.bought.ticker}: richiesti {quantity} {spec.sold.ticker}; "
-                             f"minimo copribile {spec.cex} {minimum}, massimo {maximum} {spec.sold.ticker}. "
-                             + (f"Importo sotto il minimo dell'hedge {spec.cex}, non necessariamente fondi mancanti. "
-                                "Aumentare la quantità (o la percentuale custom auto) e gli eventuali tetti/budget "
-                                "almeno al minimo indicato; poi ricontrollare la copertura residua."
-                                if quantity < minimum else
-                                "Il book non consente un hedge valido: attendere più liquidità o liberare la profondità impegnata dagli altri ordini.")
-                             + ' ' + funds_report(shortages))
+        if not funding_target and quantity < minimum:
+            raise ValueError(capacity_explanation(spec, shortages, requested, quantity,
+                                                 minimum, maximum, limiting, depth_details))
+        if not funding_target and not walk.complete:
+            heading = f"Not enough market depth to complete the hedge on {spec.cex}"
+            remedy = 'Wait for more market depth or release other confirmed hedge reservations, then repeat the preview.'
+            raise ValueError(
+                f"{heading}\n{spec.sold.ticker} → {spec.bought.ticker}\n"
+                f"Requested quantity: {preview_amount(quantity)} {spec.sold.ticker}.\n"
+                f"Minimum: {preview_amount(minimum)} {spec.sold.ticker}. Maximum now: {preview_amount(maximum)} {spec.sold.ticker}.\n"
+                f"Funds check for {preview_amount(requested)} {spec.sold.ticker}:\n"
+                + funds_report(shortages, spec.cex) + '\n' + remedy
+            )
         payload_legs.append({"cex": spec.cex, "symbol": route.symbol, "asset": route.asset, "side": side.value,
                              "quantity": str(exact), "limit_price": str(boundary),
                              "quantity_step": str(snap.quantity_step), "snapshot_ms": str(snap.observed_at_ms)})
@@ -427,6 +419,72 @@ def preview_strategy(
     policy = ('fixed' if spec.quantity_mode == 'fixed' else
               f'custom auto {(spec.auto_fraction * 100).normalize():f}%' if spec.auto_fraction < 1 else 'max auto')
     return StrategyPreview(plan, caps, tuple(payload_legs), evidence, valuations, policy)
+
+
+def preview_amount(value):
+    """Compact English display only; never reuse rounded values in a plan."""
+    number = D(value)
+    rounded = number.quantize(D('0.00000001'))
+    text = format(rounded, 'f').rstrip('0').rstrip('.')
+    return ('≈ ' if rounded != number else '') + (text or '0')
+
+
+def capacity_explanation(spec, funds, evaluated, desired, minimum, maximum, limiting, depths):
+    depth_keys = [key for key in limiting if key.endswith('_profondità_50%')]
+    heading = (f"Not enough available market depth on {spec.cex}" if depth_keys else
+               'The quantity does not meet the current maker limits')
+    lines = [heading, f"{spec.sold.ticker} → {spec.bought.ticker}", '']
+    for row in depths:
+        key = f"{row['side']}_{row['asset']}_profondità_50%"
+        if key not in depth_keys:
+            continue
+        asset = row['asset']
+        verb = 'buy' if row['side'] == 'BUY' else 'sell'
+        percent = preview_amount(D(row['allowed_fraction']) * D(100))
+        impact = preview_amount(spec.impact * D(100))
+        lines.extend([
+            f"To hedge this maker, {asset} must be available to {verb} on {spec.cex}.",
+            f"Book quantity within the allowed {impact}% price impact: {preview_amount(row['visible_within_impact'])} {asset}.",
+            f"Usable under the {percent}% depth limit: {preview_amount(row['allowed_before_reservations'])} {asset}.",
+            f"Reserved for other hedge obligations: {preview_amount(row['reserved_for_other_hedges'])} {asset}.",
+            f"Remaining for this maker: {preview_amount(row['remaining'])} {asset}.",
+            f"Minimum needed for this hedge leg: {preview_amount(minimum * D(row['minimum_hedge_quantity_units']))} {asset}.",
+            '',
+        ])
+    if desired is not None:
+        label = 'Quantity calculated in Auto mode' if spec.quantity_mode == 'auto' else 'Requested fixed quantity'
+        lines.append(f"{label}: {preview_amount(desired)} {spec.sold.ticker}.")
+    lines.extend([
+        f"Minimum maker quantity: {preview_amount(minimum)} {spec.sold.ticker}.",
+        f"Maximum allowed now: {preview_amount(maximum)} {spec.sold.ticker}.",
+    ])
+    if maximum < minimum:
+        lines.append('No valid maker quantity is currently available: the maximum is below the minimum. Reducing the quantity will not help.')
+    elif desired is not None and desired > maximum:
+        lines.append(f"Requested quantity: {preview_amount(desired)} {spec.sold.ticker}. Reduce it to the allowed maximum or release the limiting capacity.")
+    else:
+        lines.append('The requested quantity must meet the hedge minimum and all current limits.')
+    if limiting:
+        lines.append('Limiting conditions: ' + ', '.join(funding_limit_label(key, spec.cex) for key in limiting) + '.')
+    lines.extend(['', f"Funds check for {preview_amount(evaluated)} {spec.sold.ticker}:"])
+    for row in funds:
+        status = 'sufficient' if D(row['missing']) == ZERO else 'insufficient'
+        lines.append(f"{row['asset']}: {status}; required {preview_amount(row['required'])}, net available {preview_amount(row['available'])}, missing {preview_amount(row['missing'])}.")
+    if all(D(row['missing']) == ZERO for row in funds):
+        lines.append('Funds are sufficient for this evaluated quantity. The blocker is a quantity or market-capacity limit, not missing CEX funds.')
+        if depth_keys:
+            lines.append('Adding funds alone does not increase the remaining market depth.')
+    lines.extend(['', 'Possible solutions:'])
+    if depth_keys:
+        lines.extend([
+            '• Wait for more market depth within the allowed price range, then retry.',
+            '• Reduce or pause another maker using the same CEX market and hedge side. Capacity is released only after the change or withdrawal is confirmed; pending obligations may still reserve it.',
+            '• Choose another supported CEX with enough market depth, available funds and the required hedge markets.',
+        ])
+    else:
+        lines.append('• Check the limiting quantity setting, remaining wallet balance, budget, daily limit or custom auto percentage shown above, then retry.')
+    lines.append('The existing price impact and depth safety limits remain unchanged. A new preview must confirm all requirements.')
+    return '\n'.join(lines)
 
 
 def funding_limit_label(key, venue):
@@ -498,8 +556,8 @@ def funding_explanation(spec, rows, context, evaluated, desired, minimum, maximu
     return '\n'.join(lines)
 
 
-def funds_report(rows):
-    return ' '.join(f"MEXC {r['asset']}: necessari {r['required']}, disponibili netti {r['available']}, mancanti {r['missing']}." for r in rows)
+def funds_report(rows, venue='MEXC'):
+    return '\n'.join(f"{venue} {r['asset']}: required {preview_amount(r['required'])}, net available {preview_amount(r['available'])}, missing {preview_amount(r['missing'])}." for r in rows)
 
 
 def limit_description(key):
