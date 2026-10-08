@@ -85,6 +85,23 @@ running executable, and stopping only a standalone TUI is not stopping its servi
    holds because a response was late. A finished flag alone is not successful
    settlement or a verified accounting result.
 
+### Preview funding explanation
+
+When missing CEX funds prevent a valid quantity, the preview explains each
+hedge asset separately: free exchange balance, coverage reserved for established
+maker UUIDs (with the contributing order count), other pending or unattributed
+obligations, net available funds, required funds and the shortage. It names the
+quantity used for the funds calculation: Auto below the minimum evaluates the
+minimum hedge quantity, while Fixed evaluates the requested quantity. Exact
+Decimal values remain available in the message; the diagnostic report adds
+`funding_context` without changing sizing or financial authority.
+
+Suggested remedies are funding the selected venue, choosing a supported venue
+with the necessary markets, or pausing a contributing maker and repeating the
+preview. Pause is not immediate release: withdrawal must be confirmed and swap/
+uncertain-operation obligations must be resolved. Increasing quantity alone does
+not cure a funding shortage. Minimums, depth, budgets and precision still apply.
+
 ### How to interpret state
 
 | Observation | Interpretation |
