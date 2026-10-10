@@ -94,13 +94,13 @@ def _settings(bootstrap: dict[str, object]) -> tuple[Settings, str, bool]:
     configure_wallet_proxy(proxy if mode == "tor" else None)
     snapshot, event = _state_secrets(state_dir)
     requested_markets = bootstrap.get("markets")
-    if requested_markets is None:
-        markets = Settings().markets
-    elif (isinstance(requested_markets, list) and requested_markets
-          and all(isinstance(item, str) and item for item in requested_markets)):
-        markets = tuple(requested_markets)
-    else:
-        raise ValueError("markets must be a non-empty string list")
+    # Accept the legacy bootstrap field for protocol compatibility only. Wallet
+    # strategies are the sole source of registered markets; no CLI defaults.
+    if requested_markets is not None and not (
+        isinstance(requested_markets, list)
+        and all(isinstance(item, str) and item for item in requested_markets)
+    ):
+        raise ValueError("markets must be a string list")
     live = bootstrap.get("live", {})
     live_keys = {"kdf_order_writes", "auto_hedge", "cex_trading"}
     if (not isinstance(live, dict) or set(live) - live_keys or any(
@@ -122,7 +122,7 @@ def _settings(bootstrap: dict[str, object]) -> tuple[Settings, str, bool]:
         raise ValueError("cex_profile is invalid")
     settings = replace(
         Settings(),
-        markets=markets,
+        markets=(),
         kdf_rpc_url=rpc_url,
         kdf_rpc_userpass=userpass,
         kdf_coins_path=str(coins),

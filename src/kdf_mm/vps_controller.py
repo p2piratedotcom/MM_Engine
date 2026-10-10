@@ -100,20 +100,23 @@ class VpsController:
         if not self.mexc_base_asset or not self.mexc_quote_asset:
             raise ValueError("MEXC coverage assets are required")
         self.coverage = coverage
-        default_spec = MarketSpec(
-            market_id=f"{self.base_ticker}-{kdf_quote_ticker}",
-            quote_ticker=kdf_quote_ticker,
-            base_ticker=self.base_ticker,
-            arrr_cex_symbol=market_data.symbol,
+        # None preserves the standalone CLI's configured primary market.
+        # An explicit empty tuple starts wallet mode with no markets or default.
+        selected = markets if markets is not None else (
+            MarketSpec(
+                market_id=f"{self.base_ticker}-{kdf_quote_ticker}",
+                quote_ticker=kdf_quote_ticker,
+                base_ticker=self.base_ticker,
+                arrr_cex_symbol=market_data.symbol,
+            ),
         )
-        selected = markets or (default_spec,)
         if len({spec.market_id for spec in selected}) != len(selected):
             raise ValueError("market ids must be unique")
-        if {spec.base_ticker for spec in selected} != {self.base_ticker}:
+        if selected and {spec.base_ticker for spec in selected} != {self.base_ticker}:
             raise ValueError("all markets must use the configured base ticker")
         self.markets = {spec.market_id: spec for spec in selected}
-        self.default_market_id = selected[0].market_id
-        stores = {market_data.symbol: market_data}
+        self.default_market_id = selected[0].market_id if selected else None
+        stores = {market_data.symbol: market_data} if selected else {}
         if market_data_by_symbol is not None:
             stores.update({key.upper(): value for key, value in market_data_by_symbol.items()})
         missing = {
@@ -149,6 +152,10 @@ class VpsController:
     def inventory_pool(self, market_id: str, dex_side: DexSide) -> str:
         return self.market_spec(market_id).inventory_pool(dex_side)
 
+    @property
+    def mode(self) -> str:
+        return "ORDERS_ENABLED" if self.kdf.orders_enabled else "SIMULATION"
+
     def status(self) -> dict[str, Any]:
         detailed = self.all_market_statuses()["markets"]
         market_states = {
@@ -160,14 +167,29 @@ class VpsController:
             }
             for market_id, item in detailed.items()
         }
-        primary = market_states[self.default_market_id]
+        primary_spec = self.markets.get(self.default_market_id)
+        primary = market_states.get(self.default_market_id)
+        primary_available = primary_spec is not None and primary is not None
+        if not primary_available:
+            # Wallet strategies register markets dynamically. Do not substitute
+            # another market or expose the CLI seed as a registered wallet market.
+            primary = {
+                "state": (
+                    "NO_MARKETS" if not market_states else
+                    "NO_DEFAULT_MARKET" if self.default_market_id is None else
+                    "DEFAULT_MARKET_UNAVAILABLE"
+                ),
+                "age_ms": None,
+                "sequence": None,
+                "active": False,
+            }
         return {
             "service": "kdf-mm-vps-agent",
-            "mode": "ORDERS_ENABLED" if self.kdf.orders_enabled else "SIMULATION",
+            "mode": self.mode,
             "kdf_quote_ticker": self.kdf_quote_ticker,
             "base_ticker": self.base_ticker,
-            "hedge_symbol": self.market_spec().base_cex_symbol,
-            "default_market_id": self.default_market_id,
+            "hedge_symbol": primary_spec.base_cex_symbol if primary_available else None,
+            "default_market_id": self.default_market_id if primary_available else None,
             "market_data": primary,
             "markets": market_states,
             "owned_open_orders": len(self.ownership.active()),
@@ -675,7 +697,10 @@ class VpsController:
                     **activity[market_id],
                     "error": str(exc),
                 }
-        return {"default_market_id": self.default_market_id, "markets": result}
+        return {
+            "default_market_id": self.default_market_id if self.default_market_id in result else None,
+            "markets": result,
+        }
 
     def ingest_market_snapshot(self, payload: Mapping[str, Any]):
         symbol = str(payload.get("symbol", "")).upper()

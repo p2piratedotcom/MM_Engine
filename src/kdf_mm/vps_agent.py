@@ -805,7 +805,8 @@ def _query_integer(
 
 
 def build_controller(
-    settings: Settings, *, coverage: CoverageGuard | None = None
+    settings: Settings, *, coverage: CoverageGuard | None = None,
+    wallet_mode: bool = False,
 ) -> VpsController:
     state_path = Path(settings.state_db)
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -818,7 +819,7 @@ def build_controller(
         orders_enabled=settings.kdf_order_writes,
         diagnostic_path=str(state_path.parent / "kdf-rpc-diagnostics.jsonl"),
     )
-    markets = select_market_specs(
+    markets = () if wallet_mode else select_market_specs(
         settings.markets,
         primary_symbol=settings.pair,
         primary_quote_ticker=settings.kdf_quote_ticker,
@@ -837,7 +838,14 @@ def build_controller(
         )
         for symbol in symbols
     }
-    market = stores[markets[0].arrr_cex_symbol]
+    # Wallet strategies need signing/timing settings for their stores, but no
+    # seed symbol, subscription or primary market. This template is unregistered.
+    market = stores[markets[0].arrr_cex_symbol] if markets else MarketDataStore(
+        symbol="",
+        secret=settings.snapshot_secret,
+        max_age_ms=settings.market_data_max_age_ms,
+        clock_ms=lambda: time.time_ns() // 1_000_000,
+    )
     coin_registry = (
         CoinRegistry.from_manifest(settings.kdf_coins_manifest)
         if settings.kdf_coins_manifest
@@ -885,14 +893,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
         audit_db=settings.coverage_audit_db,
         max_override_seconds=settings.coverage_override_seconds,
     )
-    controller = build_controller(settings, coverage=coverage)
-    if wallet_mode:
-        # Wallet strategies register their own venue-qualified markets/stores
-        # below, including paused strategies restored from durable storage.
-        # Keep market_data as the signing/clock template, but do not retain CLI
-        # seed markets whose stores would have no matching wallet feed.
-        controller.markets = {}
-        controller.market_data_by_symbol = {}
+    controller = build_controller(settings, coverage=coverage, wallet_mode=wallet_mode)
     coin_profiles = CoinProfileStore(settings.coin_profile_path)
     outbox = HedgeEventOutbox(
         settings.outbox_db,
@@ -1119,7 +1120,7 @@ def serve(settings: Settings, *, start_kdf: bool = False, with_mexc: bool = Fals
         strategies.start()
         print(
             f"KDF Agent listening on {settings.agent_bind}:{settings.agent_port} "
-            f"({controller.status()['mode']})"
+            f"({controller.mode})"
         )
         if on_ready is not None:
             on_ready(settings.agent_port, server)

@@ -47,6 +47,10 @@ selection lives in `src/kdf_mm/inventory_reservations.py`.
 - In wallet-service mode attach to the wallet's KDF/Tor only. Never start/stop them
   or share a state directory with a standalone operator instance. Persisted locks,
   intent records and signing material are not disposable temporary files.
+- Wallet markets come only from user strategies, including restored paused
+  configurations. Start with zero registered markets and no default; never
+  construct CLI seed markets as a wallet startup fallback. Status must support
+  empty markets and null primary identifiers; see `docs/WALLET_INTEGRATION.md`.
 - Preview is not live permission. Quote publication, auto hedge and CEX trading
   require the established explicit permissions/confirmation flows. Wallet-mode
   transfers remain disabled. A manual pause never grants automatic resumption.

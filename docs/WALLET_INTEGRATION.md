@@ -24,7 +24,9 @@ bridge. The explicit `direct` mode requires no proxy. A failed Tor route must
 not fall back to a direct connection. The engine routes outbound MEXC/Gate
 HTTP through this bridge; local KDF and engine RPC stay on loopback.
 
-Optional `markets` is a non-empty list of KDF market IDs. Optional
+The legacy optional `markets` string list is accepted for protocol compatibility
+but does not register wallet markets. Only user strategies register markets;
+wallet mode starts without predefined markets or a default market. Optional
 `cex_profile` selects the Linux Secret Service profile. `with_cex` starts the
 local CEX worker and requires locally stored MEXC credentials; Gate credentials
 are optional. For preview, keep it false. All `live` flags default to false:
@@ -85,13 +87,32 @@ closing, and should not claim that an in-progress hedge is complete.
 Wallet mode starts with an explicitly allowed empty feed group. Stored
 strategies (including paused ones) register their own markets, venue-qualified
 stores and feeds before the service becomes ready. With no strategies, no
-exchange feed runs. The controller retains its signing/clock template but drops
-the CLI's predefined markets/stores so active wallet coins cannot subscribe to
+exchange feed runs. The controller keeps an unregistered signing/clock template
+with no symbol and never constructs the CLI's predefined markets/stores, so
+active wallet coins cannot subscribe to
 unregistered feeds, and MEXC strategies cannot reuse a store with no feed.
 Standalone CLI mode still requires a nonempty initial feed group. This fixes
 the v0.2.0 wallet startup failure `at least one public feed is required`.
 
-Local diagnosis on 2026-10-04 reproduced that exception using the released
+The controller status also supports zero registered markets. In that case,
+`markets` is empty, `default_market_id` and `hedge_symbol` are JSON null, and
+`market_data` has state `NO_MARKETS`, `active: false`, and null age/sequence.
+Registering wallet strategies does not assign a default; their markets are
+listed explicitly and the primary state is `NO_DEFAULT_MARKET`. When a
+standalone controller's configured default is absent, the primary
+state is `DEFAULT_MARKET_UNAVAILABLE` with the same null primary identifiers;
+the registered markets remain available in `markets`. The market-list endpoint
+also returns a null default when it is not registered. No substitute default
+or CLI seed market is selected in wallet mode. With the configured CLI default present, the
+existing primary status fields are unchanged. The startup banner reads mode
+independently of market/coverage status so it cannot block `MM_ENGINE_READY`
+on primary-market lookup. Trading permissions remain separately controlled.
+
+This source correction addresses the v0.2.1 empty-market `KeyError` reported
+on 10 October 2026. It has not yet been verified through a rebuilt distributed
+binary; source availability is not proof that an installed release contains it.
+
+Local diagnosis on 2026-10-04 reproduced the empty-feed exception using the released
 v0.2.0 Linux binary with disposable credentials and inaccessible loopback
 RPC/proxy endpoints. The rebuilt candidate reached `MM_ENGINE_READY`, loaded
 one copied saved strategy, reported all seven installed venues with
