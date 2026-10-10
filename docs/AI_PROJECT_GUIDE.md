@@ -58,6 +58,12 @@ lease operations; the GUI token cannot impersonate that worker. `/health` proves
 only process life. Wallet mode excludes KDF lifecycle, wallet-send, operator
 publication controls and coverage overrides. Its transfers remain disabled.
 
+Wallet status permits zero registered markets without inventing a CLI market.
+Primary market identifiers are null when the configured default is absent;
+the startup mode is independent of market status. See the wallet contract's
+feed initialization section for the explicit states and release verification
+limits of this source correction.
+
 Only one engine owns a profile directory/KDF wallet. Private state and signing
 secrets are persisted with restrictive permissions and process locks. Safe
 shutdown reports `MM_ENGINE_STOPPED`, owned orders remaining and any cancel error.
