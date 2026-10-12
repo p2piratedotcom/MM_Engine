@@ -302,3 +302,13 @@ or cancellation recovery. Terminal publication UUIDs are excluded from
 that intent guard. Existing order/swaps/reconciliation checks and archive
 history preservation still apply. The wallet uses this additive capability
 to enable Delete; no protocol major-version change is required.
+
+
+## Opposite-maker capability
+
+Wallet capability `maker_opposite_pair: 1` explicitly advertises the existing
+`/v1/strategies/opposite` plus two-spec group preview/create contract. The wallet
+requires this flag to enable its inverse-order checkbox. Older protocol-1 engines
+can still create one maker; absence of this capability must not be inferred as
+paired support from the protocol number or deletion capability. The flag grants
+no live permission, funds or hedge authority and changes no sizing/TTL guards.
