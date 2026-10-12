@@ -293,3 +293,12 @@ is not implemented by this candidate; only eligibility compatibility is added.
 Below-minimum sizing uses the same capacity explanation and names the binding limits instead of giving a generic increase-quantity instruction. Auto-calculated quantities are explicitly distinguished from user-entered Fixed quantities. The funds check states its evaluated quantity; sufficient funds do not establish sufficient KDF balance, budget, depth or precision capacity.
 
 Safety cooldown copy uses whole English messages and minutes/seconds. It describes the earliest resumption of eligibility checks, not a promised republication time. Fresh market data, hedge funds/depth, venue minimums and all existing limits must still pass. Cooldown timing, stored source metadata, confirmation resets and manual-pause behavior are unchanged.
+
+## Maker deletion guard capability
+
+`maker_delete_pending_guard: 1` means strategy deletion rechecks state
+after any pause and refuses unresolved publication (including HELD), update
+or cancellation recovery. Terminal publication UUIDs are excluded from
+that intent guard. Existing order/swaps/reconciliation checks and archive
+history preservation still apply. The wallet uses this additive capability
+to enable Delete; no protocol major-version change is required.

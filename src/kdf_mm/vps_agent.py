@@ -177,6 +177,7 @@ def handler_factory(
                                  "plugin_protocol": 1,
                                  "plugins_external": installed_plugins() is not None,
                                  "optional_hedging": 1, "shared_coverage": 1,
+                                 "maker_delete_pending_guard": 1,
                                  "rebalance": wallet_rebalance is not None,
                                  "rebalance_selection": 1 if wallet_rebalance is not None else 0,
                                  "rebalance_ideal": wallet_rebalance is not None,

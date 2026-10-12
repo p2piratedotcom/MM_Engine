@@ -228,3 +228,24 @@ static analysis passed; Impeller disabled. After login, both legacy cancellation
 blocks recovered through KDF readback. Subsequent coverage withdrawals are
 separate events. New unit tests were not run for the cancellation change; CI
 results and a longer live observation window must be recorded separately.
+
+## Maker deletion pending-operation guard
+
+The additive wallet capability `maker_delete_pending_guard: 1` advertises guarded
+strategy deletion. `/v1/strategies/delete-group` accepts one or two distinct IDs
+and requires `PAUSA ED ELIMINA <comma-separated IDs>`; it pauses/withdraws before
+archiving. `/v1/strategies/delete` requires an already paused maker and the exact
+`ELIMINA <id>` confirmation. Both share the same strengthened post-pause guard.
+
+The guard requires PAUSED/disabled state, no unresolved publication intent
+(including HELD with absent/non-terminal UUID), no update intent and no pending
+cancellation recovery. Existing active-order, inventory-pool reconciliation and
+unresolved-swap guards remain. If any check fails, configuration/history remains;
+pause/withdrawal is external and cannot be rolled back. Configuration archiving
+is atomic within a requested group and preserves historical routing/consumption.
+
+The wallet's opposite-order option uses existing `/v1/strategies/opposite`, then
+previews and creates both specifications in one group request, saved paused.
+`opposite_spec` negates the premium and converts quantities/budgets into the
+opposite sold coin; no second automatic start or funds authorization is implied.
+This source change is not installed or funded-tested by documentation alone.

@@ -76,6 +76,11 @@ fixtures; it does not establish real-account or funded acceptance. Historical TU
 commands may refer to absent runtime assets. Never invoke `funded-swap-test`,
 `local-service --start-kdf`, key import or live workers just to learn the project.
 
+Maker deletion rechecks PAUSED state and all unresolved publication/update/
+cancellation intents after withdrawal; HELD publication intents keep their
+configuration for recovery. Wallet clients require capability
+`maker_delete_pending_guard: 1`; see `docs/WALLET_INTEGRATION.md`.
+
 ## Working rules
 
 - Read this file, [the project guide](docs/AI_PROJECT_GUIDE.md), and the source
