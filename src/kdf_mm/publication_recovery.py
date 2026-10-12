@@ -48,6 +48,18 @@ class PublicationRecovery:
                                    (strategy_id,)).fetchall()
         return [dict(row) for row in rows]
 
+    def unresolved(self, strategy_id: str) -> bool:
+        """Held writes still prevent removal, unless their UUID is terminal."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT 1 FROM publication_intents p "
+                "LEFT JOIN owned_orders o ON o.order_uuid=p.order_uuid "
+                "WHERE p.strategy_id=? AND p.state IN ('PENDING','REGISTERED','HELD') "
+                "AND (o.status IS NULL OR o.status NOT IN ('CANCELLED','COMPLETED')) LIMIT 1",
+                (strategy_id,),
+            ).fetchone()
+        return row is not None
+
     def state(self, intent_id, state, *, order_uuid=None, detail=''):
         with self.lock:
             self.db.execute('UPDATE publication_intents SET state=?,order_uuid=COALESCE(?,order_uuid),detail=? WHERE id=?',

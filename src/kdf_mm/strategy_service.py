@@ -815,6 +815,17 @@ class StrategyService:
                 if pause_first:
                     self.set_enabled(spec.strategy_id, False)
             for spec in targets:
+                # Pause can put a newly discovered uncertain write into HELD.
+                # Keep its configuration for UUID recovery and historical routing.
+                row = self.store.get(spec.strategy_id)
+                if (row["enabled"] or row["state"] != "PAUSED"
+                        or self.controller.publications.unresolved(spec.strategy_id)
+                        or self.controller.cancellations.pending(spec.strategy_id)
+                        or self.store.update_intent(spec.strategy_id)):
+                    raise ValueError(
+                        "Deletion blocked: resolve pending publication, update or "
+                        "withdrawal recovery before deleting this maker."
+                    )
                 if self.orders_for(spec):
                     raise ValueError("ordine KDF ancora attivo: completare la pausa prima di eliminare")
                 block = self.reconciliation.block_quote(spec.market_id, spec.side)
